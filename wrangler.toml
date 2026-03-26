@@ -1,0 +1,17 @@
+name = "siloah-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+SUPABASE_URL = "https://qsfwktybcgxqjigwbyzf.supabase.co"
+# SUPABASE_ANON_KEY set via `wrangler secret put`
+
+# Durable Objects — required by McpAgent
+[[durable_objects.bindings]]
+name = "MCP_OBJECT"
+class_name = "SiloahMCP"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SiloahMCP"]
