@@ -5,13 +5,13 @@ compatibility_flags = ["nodejs_compat"]
 
 [vars]
 SUPABASE_URL = "https://qsfwktybcgxqjigwbyzf.supabase.co"
-# SUPABASE_ANON_KEY set via `wrangler secret put`
+# SUPABASE_ANON_KEY and OPENAI_API_KEY set via `wrangler secret put`
 
-# Durable Objects — required by McpAgent
-[[durable_objects.bindings]]
-name = "MCP_OBJECT"
-class_name = "SiloahMCP"
-
+# Migration to delete old Durable Objects (no longer needed)
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["SiloahMCP"]
+
+[[migrations]]
+tag = "v2"
+deleted_classes = ["SiloahMCP"]

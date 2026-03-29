@@ -1,14 +1,16 @@
 /**
  * Siloah Travel MCP Server
  *
- * Remote MCP server on Cloudflare Workers.
+ * Stateless MCP server on Cloudflare Workers (no Durable Objects).
  * Exposes cruise search tools for LLMs and AI agents.
  *
- * Endpoint: POST /mcp (Streamable HTTP transport)
+ * MCP endpoint: POST /mcp (Streamable HTTP transport)
+ * REST endpoints: GET /api/voyages, /api/brands, /api/ships, /api/search
  */
 
-import { McpAgent } from "agents/mcp"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
+import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js"
+import { registerAppTool, registerAppResource, RESOURCE_MIME_TYPE } from "@modelcontextprotocol/ext-apps/server"
 import { createClient } from "@supabase/supabase-js"
 import OpenAI from "openai"
 import { z } from "zod"
@@ -43,19 +45,9 @@ async function searchVoyages(env: Env, params: {
 }) {
   const db = getDb(env)
 
-  // Resolve brand name → line_ids
-  let lineIds: string[] | undefined
-  if (params.brandName) {
-    const { data: lines } = await db
-      .from("cruise_lines")
-      .select("id")
-      .or(`name.ilike.%${params.brandName}%,nice_url.ilike.%${params.brandName.toLowerCase().replace(/\s+/g, "-")}%`)
-      .eq("is_enabled", true)
-    if (lines && lines.length > 0) lineIds = lines.map((l) => l.id)
-  }
-
-  const rpcParams: Record<string, unknown> = { p_limit: 10, p_offset: 0 }
-  if (lineIds) rpcParams.p_line_ids = lineIds
+  // Single RPC call — brand name resolution + slug retrieval all inside the RPC
+  const rpcParams: Record<string, unknown> = { p_limit: 20, p_offset: 0, p_skip_count: true }
+  if (params.brandName) rpcParams.p_brand_name = params.brandName
   if (params.destination) rpcParams.p_destinations = [params.destination]
   if (params.minNights) rpcParams.p_duration_min = params.minNights
   if (params.maxNights) rpcParams.p_duration_max = params.maxNights
@@ -72,30 +64,17 @@ async function searchVoyages(env: Env, params: {
   if (error) return { error: error.message }
   if (!voyages || voyages.length === 0) return { total: 0, voyages: [] }
 
-  // Get brand & ship slugs for building proper URLs
-  const lineIdSet = [...new Set(voyages.map((v: { line_id: string }) => v.line_id))]
-  const shipIdSet = [...new Set(voyages.map((v: { ship_id: string }) => v.ship_id))]
-  const [{ data: lines }, { data: ships }] = await Promise.all([
-    db.from("cruise_lines").select("id, name, nice_url").in("id", lineIdSet),
-    db.from("ships").select("id, name, nice_url").in("id", shipIdSet),
-  ])
-  const lineMap = new Map((lines ?? []).map((l: { id: string; name: string; nice_url: string }) => [l.id, l]))
-  const shipMap = new Map((ships ?? []).map((s: { id: string; name: string; nice_url: string }) => [s.id, s]))
-
   const R2 = "https://media.siloah.travel"
   return {
     total: voyages[0]?.total_count ?? 0,
-    voyages: voyages.slice(0, 10).map((v: Record<string, unknown>) => {
-      const line = lineMap.get(v.line_id as string)
-      const ship = shipMap.get(v.ship_id as string)
-      const lineSlug = line?.nice_url ?? ""
-      const shipNiceUrl = ship?.nice_url ?? ""
+    voyages: voyages.map((v: Record<string, unknown>) => {
+      const lineSlug = (v.line_nice_url as string) ?? ""
+      const shipNiceUrl = (v.ship_nice_url as string) ?? ""
       const shipSlug = shipNiceUrl.includes("/") ? shipNiceUrl.split("/").pop() : shipNiceUrl
       const slug = `${lineSlug}-${shipSlug}-${v.sail_date}-${v.nights}n`
       return {
         name: v.name,
-        brandName: line?.name ?? "",
-        shipName: ship?.name ?? "",
+        shipName: shipNiceUrl ? String(shipSlug).replace(/-/g, " ") : "",
         sailDate: v.sail_date,
         nights: v.nights,
         departurePort: v.start_port_name,
@@ -126,7 +105,7 @@ async function searchBrands(env: Env, params: { name?: string; tier?: string }) 
       description: b.description?.slice(0, 200) ?? "",
       shipCount: b.ship_count,
       cruiseCount: b.cruise_count,
-      logo: b.logo ? `https://media.siloah.travel/${b.logo}` : null,
+      logo: b.logo ? (b.logo.startsWith("http") ? b.logo : `https://media.siloah.travel/${b.logo}`) : null,
       link: `https://siloah.travel/cruise/${b.nice_url}`,
     })),
   }
@@ -198,7 +177,7 @@ async function searchByContent(env: Env, params: { query: string; source?: strin
   // Search via RPC
   const { data, error } = await db.rpc("search_content", {
     query_embedding: JSON.stringify(queryEmbedding),
-    match_count: 10,
+    match_count: 20,
     filter_source: params.source || null,
   })
 
@@ -216,20 +195,132 @@ async function searchByContent(env: Env, params: { query: string; source?: strin
   }
 }
 
-// --- MCP Server ---
+// --- Widget HTML (inline for Cloudflare Workers) ---
 
-export class SiloahMCP extends McpAgent<Env> {
-  server = new McpServer({
+const VOYAGES_WIDGET_URI = "ui://siloah/voyages.html"
+
+function getVoyagesWidgetHtml(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:var(--font-sans,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif);background:transparent;color:var(--color-text-primary,#1a1a2e);line-height:1.5}
+.container{padding:8px 0}
+.cards{display:flex;flex-direction:column;gap:12px}
+.card{display:flex;border-radius:var(--border-radius-lg,12px);overflow:hidden;border:1px solid var(--color-border-secondary,#e5e4df);background:var(--color-background-primary,#fff);box-shadow:var(--shadow-sm,0 1px 3px rgba(0,0,0,.08));transition:box-shadow .2s;text-decoration:none;color:inherit;cursor:pointer;min-height:140px}
+.card:hover{box-shadow:var(--shadow-md,0 4px 12px rgba(0,0,0,.12))}
+.card-image{width:180px;min-width:180px;background:#0c1b3a;position:relative;overflow:hidden}
+.card-image img{width:100%;height:100%;object-fit:cover;display:block}
+.card-image .placeholder{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.3);font-size:32px}
+.price-badge{position:absolute;bottom:8px;left:8px;background:rgba(12,27,58,.85);backdrop-filter:blur(8px);color:#d4aa4f;font-size:13px;font-weight:600;padding:3px 10px;border-radius:6px;letter-spacing:.02em}
+.price-badge .from{font-size:10px;font-weight:400;color:rgba(255,255,255,.6);margin-right:2px;text-transform:uppercase;letter-spacing:.05em}
+.card-body{flex:1;padding:14px 16px;display:flex;flex-direction:column;justify-content:space-between;min-width:0}
+.card-title{font-size:var(--font-text-md-size,14px);font-weight:var(--font-weight-semibold,600);line-height:1.3;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.card-ship{font-size:var(--font-text-sm-size,12px);color:var(--color-text-secondary,#6b7280);margin-bottom:8px;text-transform:capitalize}
+.card-meta{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.meta-tag{font-size:11px;padding:2px 8px;border-radius:4px;background:var(--color-background-secondary,#f5f5f0);color:var(--color-text-secondary,#6b7280);white-space:nowrap}
+.card-destinations{font-size:11px;color:var(--color-text-tertiary,#9ca3af);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card-link{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#0c1b3a;font-weight:500;text-decoration:none;margin-top:6px}
+.card-link:hover{text-decoration:underline}
+.card-link svg{width:14px;height:14px}
+.summary{font-size:var(--font-text-sm-size,13px);color:var(--color-text-secondary,#6b7280);padding:4px 0 8px}
+.empty{text-align:center;padding:24px;color:var(--color-text-tertiary,#9ca3af);font-size:14px}
+@media(max-width:420px){.card{flex-direction:column}.card-image{width:100%;min-width:100%;height:160px}}
+</style>
+</head>
+<body>
+<div class="container" id="root"><div class="empty">Loading voyages…</div></div>
+<script>
+// ChatGPT shortcut: window.openai.toolOutput has data immediately
+if(window.openai&&window.openai.toolOutput){renderVoyages(window.openai.toolOutput)}
+// ChatGPT event: openai:set_globals fires when data arrives
+window.addEventListener("openai:set_globals",function(e){
+  var d=e.detail&&e.detail.globals&&e.detail.globals.toolOutput;
+  if(d)renderVoyages(d);
+},{passive:true});
+// MCP Apps bridge: ui/notifications/tool-result (standard)
+window.addEventListener("message",function(e){
+  var m=e.data;if(!m||m.jsonrpc!=="2.0")return;
+  if(m.method==="ui/notifications/tool-result"){
+    var d=m.params&&m.params.structuredContent;
+    if(d)renderVoyages(d);
+  }
+},{passive:true});
+function renderVoyages(data){
+  var root=document.getElementById("root"),vs=data.voyages||[];
+  if(!vs.length){root.innerHTML='<div class="empty">No voyages found.</div>';return}
+  var txt=data.total>vs.length?"Showing "+vs.length+" of "+data.total.toLocaleString()+" voyages":vs.length+" voyage"+(vs.length>1?"s":"")+" found";
+  root.innerHTML='<div class="summary">'+txt+'</div><div class="cards">'+vs.map(voyageCard).join("")+'</div>';
+  reportSize();
+}
+function voyageCard(v){
+  var date=v.sailDate?fmtDate(v.sailDate):"",nights=v.nights?v.nights+" nights":"",
+    dests=Array.isArray(v.destinations)?v.destinations.slice(0,5).join(" \\u00b7 "):"",
+    price=v.price?"$"+Number(v.price).toLocaleString():null,ship=v.shipName||"",
+    img=v.image?'<img src="'+esc(v.image)+'" alt="'+esc(v.name)+'" loading="lazy">':'<div class="placeholder">\\u2693</div>',
+    pb=price?'<div class="price-badge"><span class="from">from</span> '+price+'</div>':"";
+  return '<a class="card" href="'+esc(v.link)+'" target="_blank" rel="noopener"><div class="card-image">'+img+pb+'</div><div class="card-body"><div><div class="card-title">'+esc(v.name)+'</div>'+(ship?'<div class="card-ship">'+esc(ship)+'</div>':'')+'<div class="card-meta">'+(date?'<span class="meta-tag">'+date+'</span>':'')+(nights?'<span class="meta-tag">'+nights+'</span>':'')+'</div>'+(dests?'<div class="card-destinations">'+esc(dests)+'</div>':'')+'</div><div class="card-link">View details <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg></div></div></a>';
+}
+function fmtDate(s){try{var d=new Date(s+"T00:00:00");return d.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}catch(e){return s}}
+function esc(s){return s?String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"):""}
+function reportSize(){
+  var h=Math.ceil(document.documentElement.getBoundingClientRect().height);
+  window.parent.postMessage({jsonrpc:"2.0",method:"ui/notifications/size-changed",params:{height:h}},"*");
+}
+new ResizeObserver(reportSize).observe(document.documentElement);
+</script>
+</body>
+</html>`
+}
+
+// --- Create MCP server with tools ---
+
+function createMcpServer(env: Env) {
+  const server = new McpServer({
     name: "Siloah Travel",
     version: "1.0.0",
   })
 
-  async init() {
-    // searchVoyages
-    this.server.tool(
-      "searchVoyages",
-      "Search cruise voyages by destination, date, brand, price, and ports. Returns up to 10 results with links to siloah.travel.",
-      {
+  const readOnlyAnnotations = {
+    readOnlyHint: true as const,
+    destructiveHint: false as const,
+    openWorldHint: false as const,
+  }
+
+  // --- Register UI resource for voyage cards ---
+  registerAppResource(
+    server,
+    "Voyage Cards",
+    VOYAGES_WIDGET_URI,
+    { description: "Interactive voyage search results displayed as rich cards" },
+    async () => ({
+      contents: [{
+        uri: VOYAGES_WIDGET_URI,
+        mimeType: RESOURCE_MIME_TYPE,
+        text: getVoyagesWidgetHtml(),
+        _meta: {
+          ui: {
+            prefersBorder: true,
+            csp: {
+              resourceDomains: ["https://media.siloah.travel"],
+            },
+          },
+        },
+      }],
+    })
+  )
+
+  // --- searchVoyages (with widget UI) ---
+  registerAppTool(
+    server,
+    "searchVoyages",
+    {
+      title: "Search Voyages",
+      description: "Search cruise voyages by destination, date, brand, price, and ports. Returns up to 10 results with links to siloah.travel.",
+      inputSchema: {
         destination: z.string().optional().describe("Region: Mediterranean, Caribbean, Alaska, Antarctica, Europe, Asia, Oceania, NorthAmerica, SouthAmerica, Africa, Transatlantic, Baltic, NorthernEurope"),
         departureCountryCode: z.string().optional().describe("Departure country ISO code, e.g. 'NZ', 'JP', 'TW'"),
         departureCity: z.string().optional().describe("Departure port city in English, e.g. 'Auckland', 'Miami'"),
@@ -243,57 +334,88 @@ export class SiloahMCP extends McpAgent<Env> {
         maxNights: z.number().optional().describe("Maximum nights"),
         maxPrice: z.number().optional().describe("Max price per person USD"),
       },
-      async (params) => {
-        const result = await searchVoyages(this.env, params)
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] }
+      annotations: readOnlyAnnotations,
+      _meta: {
+        ui: { resourceUri: VOYAGES_WIDGET_URI },
+        "openai/toolInvocation/invoking": "Searching luxury cruise voyages…",
+        "openai/toolInvocation/invoked": "Voyages found.",
+      },
+    },
+    async (params) => {
+      const result = await searchVoyages(env, params)
+      return {
+        // structuredContent → sent to the widget for rendering
+        structuredContent: result as Record<string, unknown>,
+        // content → narration for the model (text summary)
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       }
-    )
+    }
+  )
 
-    // searchBrands
-    this.server.tool(
-      "searchBrands",
-      "Search cruise brands/lines. Returns brand info with links to siloah.travel.",
-      {
+  // --- searchBrands (text-only, no widget yet) ---
+  registerAppTool(
+    server,
+    "searchBrands",
+    {
+      title: "Search Brands",
+      description: "Search cruise brands/lines. Returns brand info with links to siloah.travel.",
+      inputSchema: {
         name: z.string().optional().describe("Brand name, e.g. 'Silversea', 'Ponant'"),
         tier: z.string().optional().describe("Tier: 'ultra_luxury', 'luxury', 'popular'"),
       },
-      async (params) => {
-        const result = await searchBrands(this.env, params)
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] }
-      }
-    )
+      annotations: readOnlyAnnotations,
+      _meta: {},
+    },
+    async (params) => {
+      const result = await searchBrands(env, params)
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] }
+    }
+  )
 
-    // searchShips
-    this.server.tool(
-      "searchShips",
-      "Search cruise ships by name, brand, type, or passenger capacity. Returns ship specs with links to siloah.travel.",
-      {
+  // --- searchShips (text-only, no widget yet) ---
+  registerAppTool(
+    server,
+    "searchShips",
+    {
+      title: "Search Ships",
+      description: "Search cruise ships by name, brand, type, or passenger capacity. Returns ship specs with links to siloah.travel.",
+      inputSchema: {
         name: z.string().optional().describe("Ship name, e.g. 'Silver Nova'"),
         brandName: z.string().optional().describe("Cruise line, e.g. 'Silversea'"),
         shipType: z.string().optional().describe("Type: 'ocean', 'river', 'expedition'"),
         minPassengers: z.number().optional().describe("Min passenger capacity"),
         maxPassengers: z.number().optional().describe("Max passenger capacity"),
       },
-      async (params) => {
-        const result = await searchShips(this.env, params)
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] }
-      }
-    )
+      annotations: readOnlyAnnotations,
+      _meta: {},
+    },
+    async (params) => {
+      const result = await searchShips(env, params)
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] }
+    }
+  )
 
-    // searchByContent (RAG)
-    this.server.tool(
-      "searchByContent",
-      "Search Siloah Travel's knowledge base for detailed information about ship restaurants, dining, facilities, amenities, cabin types, port guides, or brand features. Use this when the question is about specific details, not for searching voyages.",
-      {
+  // --- searchByContent (RAG, text-only) ---
+  registerAppTool(
+    server,
+    "searchByContent",
+    {
+      title: "Search Knowledge Base",
+      description: "Search Siloah Travel's knowledge base for detailed information about ship restaurants, dining, facilities, amenities, cabin types, port guides, or brand features. Use this when the question is about specific details, not for searching voyages.",
+      inputSchema: {
         query: z.string().describe("The question or topic to search for, in English. E.g. 'Silver Nova restaurants', 'Silversea butler service', 'Santorini port guide'"),
         source: z.string().optional().describe("Filter by source: ships, ship_dining, ship_facilities, cabin_types, cruise_lines, cruises, canonical_ports. Leave empty to search all."),
       },
-      async (params) => {
-        const result = await searchByContent(this.env, params)
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] }
-      }
-    )
-  }
+      annotations: readOnlyAnnotations,
+      _meta: {},
+    },
+    async (params) => {
+      const result = await searchByContent(env, params)
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] }
+    }
+  )
+
+  return server
 }
 
 // --- OpenAPI spec for ChatGPT Actions ---
@@ -395,12 +517,12 @@ const OPENAPI_SPEC = {
   },
 }
 
-// --- CORS headers for ChatGPT ---
+// --- CORS headers ---
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, mcp-session-id",
 }
 
 function jsonResponse(data: unknown) {
@@ -409,10 +531,10 @@ function jsonResponse(data: unknown) {
   })
 }
 
-// --- Worker entry point ---
+// --- Worker entry point (no Durable Objects) ---
 
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+  async fetch(request: Request, env: Env) {
     const url = new URL(request.url)
 
     // CORS preflight
@@ -483,9 +605,38 @@ export default {
       }).then(jsonResponse)
     }
 
-    // MCP endpoint — root path so URL is just https://mcp.siloah.travel
-    if (url.pathname === "/" || url.pathname === "/mcp" || url.pathname === "/sse") {
-      return SiloahMCP.serve(url.pathname).fetch(request, env, ctx)
+    // MCP endpoint — stateless Streamable HTTP (no Durable Objects)
+    if (url.pathname === "/" || url.pathname === "/mcp") {
+      if (request.method === "GET") {
+        return jsonResponse({
+          name: "Siloah Travel MCP Server",
+          version: "1.0.0",
+          description: "Search 26,000+ luxury cruise voyages, 200+ ships, and 20 premium cruise brands worldwide.",
+          mcpEndpoint: "POST /mcp",
+        })
+      }
+
+      if (request.method === "POST") {
+        const server = createMcpServer(env)
+        const transport = new WebStandardStreamableHTTPServerTransport({
+          sessionIdGenerator: undefined, // stateless — no session tracking
+          enableJsonResponse: true,      // simpler JSON responses (no SSE)
+        })
+        await server.connect(transport)
+        const response = await transport.handleRequest(request)
+        // Add CORS headers
+        const headers = new Headers(response.headers)
+        headers.set("Access-Control-Allow-Origin", "*")
+        return new Response(response.body, {
+          status: response.status,
+          headers,
+        })
+      }
+
+      // DELETE for session cleanup — just return 200 since we're stateless
+      if (request.method === "DELETE") {
+        return new Response(null, { status: 200, headers: CORS })
+      }
     }
 
     return new Response("Not Found", { status: 404 })
