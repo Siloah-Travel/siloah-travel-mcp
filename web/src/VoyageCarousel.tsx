@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from "react"
 import useEmblaCarousel from "embla-carousel-react"
 import { ChevronLeft, ChevronRight } from "lucide-react"
+import { t } from "./i18n"
 
 interface Voyage {
   name: string
@@ -15,7 +16,7 @@ interface Voyage {
   link: string
 }
 
-export function VoyageCarousel({ voyages }: { voyages: Voyage[] }) {
+export function VoyageCarousel({ voyages, onSelectVoyage }: { voyages: Voyage[]; onSelectVoyage?: (index: number) => void }) {
   const [emblaRef, emblaApi] = useEmblaCarousel({
     align: "start",
     containScroll: "trimSnaps",
@@ -49,7 +50,7 @@ export function VoyageCarousel({ voyages }: { voyages: Voyage[] }) {
       <div ref={emblaRef} style={{ overflow: "hidden" }}>
         <div style={{ display: "flex", gap: 12 }}>
           {voyages.map((v, i) => (
-            <VoyageCard key={i} voyage={v} />
+            <VoyageCard key={i} voyage={v} onClick={onSelectVoyage ? () => onSelectVoyage(i) : undefined} />
           ))}
         </div>
       </div>
@@ -91,16 +92,21 @@ export function VoyageCarousel({ voyages }: { voyages: Voyage[] }) {
   )
 }
 
-function VoyageCard({ voyage: v }: { voyage: Voyage }) {
+function VoyageCard({ voyage: v, onClick }: { voyage: Voyage; onClick?: () => void }) {
   const date = v.sailDate ? formatDate(v.sailDate) : ""
   const price = v.price ? `$${Number(v.price).toLocaleString()}` : null
   const dests = Array.isArray(v.destinations) ? v.destinations.slice(0, 4).join(" · ") : ""
+
+  const handleClick = (e: React.MouseEvent) => {
+    if (onClick) { e.preventDefault(); onClick() }
+  }
 
   return (
     <a
       href={v.link}
       target="_blank"
       rel="noopener noreferrer"
+      onClick={handleClick}
       style={{
         flex: "0 0 260px",
         borderRadius: 12,
@@ -143,7 +149,7 @@ function VoyageCard({ voyage: v }: { voyage: Voyage }) {
             color: "#d4aa4f", fontSize: 13, fontWeight: 600,
             padding: "3px 10px", borderRadius: 6,
           }}>
-            <span style={{ fontSize: 10, color: "rgba(255,255,255,0.55)", marginRight: 3, textTransform: "uppercase" }}>from</span>
+            <span style={{ fontSize: 10, color: "rgba(255,255,255,0.55)", marginRight: 3, textTransform: "uppercase" }}>{t("from_price")}</span>
             {price}
           </div>
         )}
@@ -166,7 +172,7 @@ function VoyageCard({ voyage: v }: { voyage: Voyage }) {
           )}
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 6 }}>
             {date && <Tag>{date}</Tag>}
-            {v.nights > 0 && <Tag>{v.nights} nights</Tag>}
+            {v.nights > 0 && <Tag>{t("nights", { n: v.nights })}</Tag>}
           </div>
           {dests && (
             <div style={{
@@ -181,7 +187,7 @@ function VoyageCard({ voyage: v }: { voyage: Voyage }) {
           fontSize: 12, color: "#0c1b3a", fontWeight: 500, marginTop: 8,
           display: "flex", alignItems: "center", gap: 4,
         }}>
-          View details →
+          {t("view_details")}
         </div>
       </div>
     </a>

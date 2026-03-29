@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from "react"
 import useEmblaCarousel from "embla-carousel-react"
 import { ChevronLeft, ChevronRight, Star, Anchor, Users, Ship as ShipIcon } from "lucide-react"
+import { t } from "./i18n"
 
 interface Ship {
   name: string
@@ -16,7 +17,7 @@ interface Ship {
   link: string
 }
 
-export function ShipCarousel({ ships }: { ships: Ship[] }) {
+export function ShipCarousel({ ships, onSelectShip }: { ships: Ship[]; onSelectShip?: (index: number) => void }) {
   const [emblaRef, emblaApi] = useEmblaCarousel({
     align: "start",
     containScroll: "trimSnaps",
@@ -49,7 +50,7 @@ export function ShipCarousel({ ships }: { ships: Ship[] }) {
       <div ref={emblaRef} style={{ overflow: "hidden" }}>
         <div style={{ display: "flex", gap: 12 }}>
           {ships.map((s, i) => (
-            <ShipCard key={i} ship={s} />
+            <ShipCard key={i} ship={s} onClick={onSelectShip ? () => onSelectShip(i) : undefined} />
           ))}
         </div>
       </div>
@@ -86,18 +87,23 @@ function NavButton({ dir, onClick }: { dir: "prev" | "next"; onClick: () => void
   )
 }
 
-function ShipCard({ ship: s }: { ship: Ship }) {
+function ShipCard({ ship: s, onClick }: { ship: Ship; onClick?: () => void }) {
   const specs: string[] = []
   if (s.passengers) specs.push(`${s.passengers.toLocaleString()} guests`)
   if (s.cabins) specs.push(`${s.cabins.toLocaleString()} cabins`)
   if (s.tonnage) specs.push(`${Number(s.tonnage).toLocaleString()} GT`)
   if (s.launched) specs.push(`Built ${s.launched}`)
 
+  const handleClick = (e: React.MouseEvent) => {
+    if (onClick) { e.preventDefault(); onClick() }
+  }
+
   return (
     <a
       href={s.link}
       target="_blank"
       rel="noopener noreferrer"
+      onClick={handleClick}
       style={{
         flex: "0 0 260px",
         borderRadius: 12,
@@ -185,7 +191,7 @@ function ShipCard({ ship: s }: { ship: Ship }) {
           {s.cruiseCount > 0 && (
             <div style={{ fontSize: 11, color: "#9ca3af", display: "flex", alignItems: "center", gap: 4 }}>
               <ShipIcon size={12} />
-              {s.cruiseCount} upcoming voyages
+              {t("upcoming_voyages", { n: s.cruiseCount })}
             </div>
           )}
         </div>
@@ -194,7 +200,7 @@ function ShipCard({ ship: s }: { ship: Ship }) {
           fontSize: 12, color: "#0c1b3a", fontWeight: 500, marginTop: 8,
           display: "flex", alignItems: "center", gap: 4,
         }}>
-          View ship details →
+          {t("view_ship")}
         </div>
       </div>
     </a>

@@ -1,28 +1,41 @@
 import { useState, useEffect } from "react"
 
-/** Listen for tool results from ChatGPT host — supports both MCP bridge and window.openai */
+/** Unwrap data — handles string JSON, double-wrapped structuredContent, etc. */
+function unwrap<T>(raw: unknown): T | null {
+  if (raw == null) return null
+  let obj = raw
+  if (typeof obj === "string") {
+    try { obj = JSON.parse(obj) } catch { return null }
+  }
+  if (typeof obj !== "object") return null
+  const sc = (obj as Record<string, unknown>).structuredContent
+  if (sc && typeof sc === "object") return sc as T
+  return obj as T
+}
+
+/** Listen for tool results from ChatGPT host */
 export function useToolOutput<T>(): T | null {
   const [data, setData] = useState<T | null>(() => {
-    // ChatGPT shortcut: data available immediately
-    const w = window as unknown as { openai?: { toolOutput?: T } }
-    return w.openai?.toolOutput ?? null
+    return unwrap<T>(window.openai?.toolOutput)
   })
 
   useEffect(() => {
-    // ChatGPT event: openai:set_globals
     const onGlobals = (e: Event) => {
       const detail = (e as CustomEvent).detail
-      const d = detail?.globals?.toolOutput as T | undefined
+      const d = unwrap<T>(detail?.globals?.toolOutput)
       if (d) setData(d)
     }
 
-    // MCP Apps bridge: ui/notifications/tool-result
     const onMessage = (e: MessageEvent) => {
-      if (e.source !== window.parent) return
       const msg = e.data
-      if (!msg || msg.jsonrpc !== "2.0") return
-      if (msg.method === "ui/notifications/tool-result") {
-        const d = msg.params?.structuredContent as T | undefined
+      if (!msg) return
+      if (msg.jsonrpc === "2.0" && msg.method === "ui/notifications/tool-result") {
+        const d = unwrap<T>(msg.params?.structuredContent) ?? unwrap<T>(msg.params)
+        if (d) setData(d)
+        return
+      }
+      if (msg.type === "tool_result" || msg.type === "structuredContent") {
+        const d = unwrap<T>(msg.data ?? msg.structuredContent ?? msg)
         if (d) setData(d)
       }
     }
@@ -36,6 +49,27 @@ export function useToolOutput<T>(): T | null {
   }, [])
 
   return data
+}
+
+/** Track display mode changes */
+export function useDisplayMode() {
+  const [mode, setMode] = useState<string>(() => window.openai?.displayMode ?? "inline")
+
+  useEffect(() => {
+    const check = () => {
+      const m = window.openai?.displayMode
+      if (m) setMode(m)
+    }
+    // Poll for mode changes since there's no dedicated event
+    const interval = setInterval(check, 300)
+    window.addEventListener("openai:set_globals", check, { passive: true })
+    return () => {
+      clearInterval(interval)
+      window.removeEventListener("openai:set_globals", check)
+    }
+  }, [])
+
+  return mode
 }
 
 /** Report widget height to host for auto-sizing */

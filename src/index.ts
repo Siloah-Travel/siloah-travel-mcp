@@ -29,6 +29,16 @@ function getDb(env: Env) {
   return createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY)
 }
 
+// --- Locale normalization ---
+const LOCALE_ALIASES: Record<string, string> = {
+  zh: "zh-TW", "zh-hans": "zh-CN", "zh-hant": "zh-TW",
+}
+function normalizeLocale(raw?: string): string | null {
+  if (!raw || raw === "en") return null
+  const lc = raw.toLowerCase()
+  return LOCALE_ALIASES[lc] ?? raw
+}
+
 // --- Tool implementations ---
 
 async function searchVoyages(env: Env, params: {
@@ -44,11 +54,14 @@ async function searchVoyages(env: Env, params: {
   minNights?: number
   maxNights?: number
   maxPrice?: number
+  locale?: string
 }) {
   const db = getDb(env)
+  const locale = normalizeLocale(params.locale)
 
   // Single RPC call — brand name resolution + slug retrieval all inside the RPC
   const rpcParams: Record<string, unknown> = { p_limit: 20, p_offset: 0, p_skip_count: true }
+  if (locale) rpcParams.p_locale = locale
   if (params.brandName) rpcParams.p_brand_name = params.brandName
   if (params.destination) rpcParams.p_destinations = [params.destination]
   if (params.minNights) rpcParams.p_duration_min = params.minNights
@@ -64,19 +77,221 @@ async function searchVoyages(env: Env, params: {
 
   const { data: voyages, error } = await db.rpc("search_voyages", rpcParams)
   if (error) return { error: error.message }
-  if (!voyages || voyages.length === 0) return { total: 0, voyages: [] }
+  if (!voyages || voyages.length === 0) return { total: 0, locale: locale ?? "en", voyages: [] }
 
   const R2 = "https://media.siloah.travel"
+  const voyageIds = voyages.map((v: Record<string, unknown>) => v.id as string)
+  const shipIds = [...new Set(voyages.map((v: Record<string, unknown>) => v.ship_id as string))]
+  const lineIds = [...new Set(voyages.map((v: Record<string, unknown>) => v.line_id as string))]
+
+  // --- Parallel batch queries: name translations + itineraries + ship/brand info ---
+  const nameTransPromise = locale
+    ? db.from("translations").select("record_id, value")
+        .eq("table_name", "cruises").eq("locale", locale).eq("field_name", "name")
+        .in("record_id", voyageIds)
+    : Promise.resolve({ data: null })
+
+  const itinPromise = db.from("cruise_itineraries")
+    .select("cruise_id, day, order_id, port_name, canonical_port_id, arrive_time, depart_time")
+    .in("cruise_id", voyageIds)
+    .order("day", { ascending: true })
+    .order("order_id", { ascending: true })
+
+  // Ship + brand info
+  const shipsPromise = db.from("ships")
+    .select("id, name, tonnage, occupancy, total_cabins, launched, star_rating, ship_type")
+    .in("id", shipIds)
+  const brandsPromise = db.from("cruise_lines")
+    .select("id, name, logo")
+    .in("id", lineIds)
+
+  // Ship photos from cruise_media (fallback when RPC ship_image is null)
+  const shipPhotoPromise = db.from("cruise_media")
+    .select("entity_id, r2_key")
+    .eq("entity_type", "ship")
+    .in("entity_id", shipIds)
+    .not("r2_key", "is", null)
+    .in("role", ["cover", "default"])
+    .order("role", { ascending: true })
+    .order("sort_order", { ascending: true })
+
+  // Ship video URLs from cruise_media
+  const shipVideoPromise = db.from("cruise_media")
+    .select("entity_id, source_url")
+    .eq("entity_type", "ship")
+    .eq("role", "video")
+    .in("entity_id", shipIds)
+    .not("source_url", "is", null)
+    .limit(50)
+
+  // Ship/brand name translations
+  const shipNameTransPromise = locale
+    ? db.from("translations").select("record_id, value")
+        .eq("table_name", "ships").eq("locale", locale).eq("field_name", "name")
+        .in("record_id", shipIds)
+    : Promise.resolve({ data: null })
+  const brandNameTransPromise = locale
+    ? db.from("translations").select("record_id, value")
+        .eq("table_name", "cruise_lines").eq("locale", locale).eq("field_name", "name")
+        .in("record_id", lineIds)
+    : Promise.resolve({ data: null })
+
+  const [nameTransResult, itinResult, shipsResult, brandsResult, shipPhotoResult, shipVideoResult, shipNameTransResult, brandNameTransResult] =
+    await Promise.all([nameTransPromise, itinPromise, shipsPromise, brandsPromise, shipPhotoPromise, shipVideoPromise, shipNameTransPromise, brandNameTransPromise])
+
+  const nameMap: Record<string, string> = {}
+  if (nameTransResult.data) for (const t of nameTransResult.data) nameMap[t.record_id] = t.value
+
+  // Ship photo map (first photo per ship, prefer cover > default)
+  const shipPhotoMap: Record<string, string> = {}
+  if (shipPhotoResult.data) {
+    for (const m of shipPhotoResult.data) {
+      if (!shipPhotoMap[m.entity_id]) shipPhotoMap[m.entity_id] = m.r2_key
+    }
+  }
+
+  // Ship video map (first video per ship)
+  const shipVideoMap: Record<string, string> = {}
+  if (shipVideoResult.data) {
+    for (const m of shipVideoResult.data) {
+      if (!shipVideoMap[m.entity_id]) shipVideoMap[m.entity_id] = m.source_url
+    }
+  }
+
+  // Ship info map
+  type ShipRow = { id: string; name: string; tonnage: number | null; occupancy: number | null; total_cabins: number | null; launched: string | null; star_rating: number | null; ship_type: string | null }
+  const shipMap: Record<string, ShipRow> = {}
+  if (shipsResult.data) for (const s of shipsResult.data as ShipRow[]) shipMap[s.id] = s
+
+  // Brand info map
+  type BrandRow = { id: string; name: string; logo: string | null }
+  const brandMap: Record<string, BrandRow> = {}
+  if (brandsResult.data) for (const b of brandsResult.data as BrandRow[]) brandMap[b.id] = b
+
+  // Ship/brand name translation maps
+  const shipNameMap: Record<string, string> = {}
+  if (shipNameTransResult.data) for (const t of shipNameTransResult.data) shipNameMap[t.record_id] = t.value
+  const brandNameMap: Record<string, string> = {}
+  if (brandNameTransResult.data) for (const t of brandNameTransResult.data) brandNameMap[t.record_id] = t.value
+
+  // Group itineraries by cruise_id
+  type ItinRow = { cruise_id: string; day: number; order_id: number; port_name: string; canonical_port_id: string | null; arrive_time: string | null; depart_time: string | null }
+  const itinByCruise: Record<string, ItinRow[]> = {}
+  const allCanonicalIds = new Set<string>()
+  if (itinResult.data) {
+    for (const row of itinResult.data as ItinRow[]) {
+      ;(itinByCruise[row.cruise_id] ??= []).push(row)
+      if (row.canonical_port_id) allCanonicalIds.add(row.canonical_port_id)
+    }
+  }
+
+  // --- Fetch port photos + descriptions for all canonical ports ---
+  const canonicalIds = [...allCanonicalIds]
+  let portPhotoMap: Record<string, string> = {}
+  let portDescMap: Record<string, string> = {}
+  let portNameTransMap: Record<string, string> = {}
+  let portNameFallback: Record<string, string> = {}
+
+  if (canonicalIds.length > 0) {
+    const photoPromise = db.from("cruise_media")
+      .select("entity_id, r2_key")
+      .eq("entity_type", "canonical_port")
+      .in("entity_id", canonicalIds)
+      .not("r2_key", "is", null)
+      .order("role", { ascending: true })
+      .order("sort_order", { ascending: true })
+
+    const descPromise = db.from("canonical_ports")
+      .select("id, name, article_summary")
+      .in("id", canonicalIds)
+
+    // Port name + description translations
+    const portNameTransPromise = locale
+      ? db.from("translations").select("record_id, value")
+          .eq("table_name", "canonical_ports").eq("locale", locale).eq("field_name", "name")
+          .in("record_id", canonicalIds)
+      : Promise.resolve({ data: null })
+
+    const portDescTransPromise = locale
+      ? db.from("translations").select("record_id, value")
+          .eq("table_name", "canonical_ports").eq("locale", locale).eq("field_name", "article_summary")
+          .in("record_id", canonicalIds)
+      : Promise.resolve({ data: null })
+
+    const [photoResult, descResult, portNameTransResult, portDescTransResult] = await Promise.all([
+      photoPromise, descPromise, portNameTransPromise, portDescTransPromise,
+    ])
+
+    if (photoResult.data) {
+      // Keep only first photo per port
+      for (const p of photoResult.data) {
+        if (!portPhotoMap[p.entity_id]) portPhotoMap[p.entity_id] = `${R2}/${p.r2_key.replace("/lg/", "/sm/")}`
+      }
+    }
+    // English fallback port names + descriptions from canonical_ports
+    const descFallback: Record<string, string> = {}
+    if (descResult.data) {
+      for (const d of descResult.data) {
+        if (d.name) portNameFallback[d.id] = d.name
+        if (d.article_summary) descFallback[d.id] = d.article_summary
+      }
+    }
+    // Translated descriptions override English
+    const descTransMap: Record<string, string> = {}
+    if (portDescTransResult.data) {
+      for (const t of portDescTransResult.data) descTransMap[t.record_id] = t.value
+    }
+    // Merge: translated > English fallback
+    for (const id of canonicalIds) {
+      const desc = descTransMap[id] ?? descFallback[id]
+      if (desc) portDescMap[id] = desc
+    }
+
+    if (portNameTransResult.data) {
+      for (const t of portNameTransResult.data) portNameTransMap[t.record_id] = t.value
+    }
+  }
+
   return {
     total: voyages[0]?.total_count ?? 0,
+    locale: locale ?? "en",
     voyages: voyages.map((v: Record<string, unknown>) => {
       const lineSlug = (v.line_nice_url as string) ?? ""
       const shipNiceUrl = (v.ship_nice_url as string) ?? ""
       const shipSlug = shipNiceUrl.includes("/") ? shipNiceUrl.split("/").pop() : shipNiceUrl
       const slug = `${lineSlug}-${shipSlug}-${v.sail_date}-${v.nights}n`
+      const cruiseId = v.id as string
+
+      // Build itinerary array
+      const rawItin = itinByCruise[cruiseId] ?? []
+      const itinerary = rawItin.map((it) => {
+        const cpId = it.canonical_port_id
+        // Name priority: translated > port_name > canonical_ports.name
+        const resolvedName = (cpId && portNameTransMap[cpId])
+          ? portNameTransMap[cpId]
+          : it.port_name || (cpId && portNameFallback[cpId]) || null
+        const nameLC = (it.port_name || "").toLowerCase()
+        const isSeaDay = !resolvedName || nameLC.includes("at sea") || nameLC.includes("sea day")
+        return {
+          day: it.day,
+          portName: resolvedName ?? "",
+          arriveTime: it.arrive_time ? String(it.arrive_time).slice(0, 5) : null,
+          departTime: it.depart_time ? String(it.depart_time).slice(0, 5) : null,
+          image: cpId ? (portPhotoMap[cpId] ?? null) : null,
+          description: cpId ? (portDescMap[cpId] ?? null) : null,
+          isSeaDay,
+        }
+      })
+
+      // Ship & brand info
+      const sId = v.ship_id as string
+      const lId = v.line_id as string
+      const ship = shipMap[sId]
+      const brand = brandMap[lId]
+
       return {
-        name: v.name,
-        shipName: shipNiceUrl ? String(shipSlug).replace(/-/g, " ") : "",
+        name: nameMap[cruiseId] ?? v.name,
+        shipName: shipNameMap[sId] ?? ship?.name ?? (shipNiceUrl ? String(shipSlug).replace(/-/g, " ") : ""),
         sailDate: v.sail_date,
         nights: v.nights,
         departurePort: v.start_port_name,
@@ -84,7 +299,24 @@ async function searchVoyages(env: Env, params: {
         price: v.cheapest_price,
         destinations: v.destinations,
         image: v.cover_image ? `${R2}/${v.cover_image}` : null,
+        shipImage: v.ship_image ? `${R2}/${v.ship_image}` : (shipPhotoMap[sId] ? `${R2}/${shipPhotoMap[sId].replace("/lg/", "/sm/")}` : null),
         link: `https://siloah.travel/cruise/voyages/${slug}`,
+        itinerary,
+        // Ship & brand details
+        brand: brand ? {
+          name: brandNameMap[lId] ?? brand.name,
+          logo: brand.logo ? (brand.logo.startsWith("http") ? brand.logo : `${R2}/${brand.logo}`) : null,
+        } : null,
+        ship: ship ? {
+          name: shipNameMap[sId] ?? ship.name,
+          tonnage: ship.tonnage,
+          passengers: ship.occupancy,
+          cabins: ship.total_cabins,
+          launched: ship.launched ? String(ship.launched).slice(0, 4) : null,
+          starRating: ship.star_rating,
+          type: ship.ship_type,
+          videoUrl: shipVideoMap[sId] ?? null,
+        } : null,
       }
     }),
   }
@@ -115,9 +347,11 @@ async function searchBrands(env: Env, params: { name?: string; tier?: string }) 
 
 async function searchShips(env: Env, params: {
   name?: string; brandName?: string; shipType?: string
-  minPassengers?: number; maxPassengers?: number
+  minPassengers?: number; maxPassengers?: number; locale?: string
 }) {
   const db = getDb(env)
+  const locale = normalizeLocale(params.locale)
+
   let query = db.from("ships")
     .select("id, name, nice_url, line_name, tonnage, occupancy, total_cabins, launched, ship_type, star_rating, cruise_count")
     .eq("is_enabled", true)
@@ -130,25 +364,41 @@ async function searchShips(env: Env, params: {
   const { data, error } = await query.limit(10)
   if (error) return { error: error.message }
 
-  // Fetch hero images for all ships in one query
+  // Fetch hero images + translations in parallel
   const R2 = "https://media.siloah.travel"
   const shipIds = (data ?? []).map((s) => s.id)
   let imageMap: Record<string, string> = {}
+  let transMap: Record<string, Record<string, string>> = {}
+
   if (shipIds.length > 0) {
-    const { data: media } = await db.from("cruise_media")
+    const imagePromise = db.from("cruise_media")
       .select("entity_id, r2_key")
-      .eq("entity_type", "ship")
-      .eq("role", "hero")
-      .in("entity_id", shipIds)
-      .not("r2_key", "is", null)
-    if (media) {
-      for (const m of media) imageMap[m.entity_id] = `${R2}/${m.r2_key}`
-    }
+      .eq("entity_type", "ship").eq("role", "hero")
+      .in("entity_id", shipIds).not("r2_key", "is", null)
+      .then(({ data: media }) => {
+        if (media) for (const m of media) imageMap[m.entity_id] = `${R2}/${m.r2_key}`
+      })
+
+    const transPromise = locale
+      ? db.from("translations")
+          .select("record_id, field_name, value")
+          .eq("table_name", "ships").eq("locale", locale)
+          .in("record_id", shipIds)
+          .then(({ data: trans }) => {
+            if (trans) for (const t of trans) {
+              transMap[t.record_id] ??= {}
+              transMap[t.record_id][t.field_name] = t.value
+            }
+          })
+      : Promise.resolve()
+
+    await Promise.all([imagePromise, transPromise])
   }
 
   return {
+    locale: locale ?? "en",
     ships: (data ?? []).map((s) => ({
-      name: s.name,
+      name: transMap[s.id]?.name ?? s.name,
       brand: s.line_name,
       tonnage: s.tonnage,
       passengers: s.occupancy,
@@ -231,7 +481,7 @@ function createMcpServer(env: Env) {
           ui: {
             prefersBorder: true,
             csp: {
-              resourceDomains: ["https://media.siloah.travel"],
+              resourceDomains: ["https://media.siloah.travel", "https://i.ytimg.com", "https://www.youtube.com"],
             },
           },
         },
@@ -254,7 +504,7 @@ function createMcpServer(env: Env) {
           ui: {
             prefersBorder: true,
             csp: {
-              resourceDomains: ["https://media.siloah.travel"],
+              resourceDomains: ["https://media.siloah.travel", "https://i.ytimg.com", "https://www.youtube.com"],
             },
           },
         },
@@ -268,20 +518,21 @@ function createMcpServer(env: Env) {
     "searchVoyages",
     {
       title: "Search Voyages",
-      description: "Search cruise voyages by destination, date, brand, price, and ports. Returns up to 10 results with links to siloah.travel.",
+      description: `Search cruise voyages with multilingual support (30 languages). To find voyages visiting a specific country (e.g. Japan, Greece, Italy), use viaCountryCode with the ISO 3166-1 alpha-2 code (e.g. 'JP', 'GR', 'IT'). To find voyages visiting a specific city/port (e.g. Santorini, Tokyo), use viaCity. The 'destination' field is ONLY for broad ocean regions. IMPORTANT: Always pass the 'locale' parameter matching the user's language to get localized results (voyage names, port names, destinations in user's language).`,
       inputSchema: {
-        destination: z.string().optional().describe("Region: Mediterranean, Caribbean, Alaska, Antarctica, Europe, Asia, Oceania, NorthAmerica, SouthAmerica, Africa, Transatlantic, Baltic, NorthernEurope"),
-        departureCountryCode: z.string().optional().describe("Departure country ISO code, e.g. 'NZ', 'JP', 'TW'"),
-        departureCity: z.string().optional().describe("Departure port city in English, e.g. 'Auckland', 'Miami'"),
-        arrivalCountryCode: z.string().optional().describe("Arrival country ISO code, e.g. 'AU', 'IT'"),
+        destination: z.string().optional().describe("Broad ocean region ONLY. One of: Mediterranean, Caribbean, Alaska, Antarctica, Europe, Asia, Oceania, NorthAmerica, SouthAmerica, Africa, Transatlantic, Baltic, NorthernEurope. Do NOT put country names here."),
+        departureCountryCode: z.string().optional().describe("ISO 3166-1 alpha-2 code of departure country, e.g. 'US', 'GB', 'AU', 'JP'"),
+        departureCity: z.string().optional().describe("Departure port city in English, e.g. 'Auckland', 'Miami', 'Southampton'"),
+        arrivalCountryCode: z.string().optional().describe("ISO 3166-1 alpha-2 code of arrival country"),
         arrivalCity: z.string().optional().describe("Arrival port city in English, e.g. 'Sydney', 'Venice'"),
-        viaCountryCode: z.string().optional().describe("Via country ISO code, e.g. 'JP', 'GR'"),
-        viaCity: z.string().optional().describe("Via city/place in English, e.g. 'Santorini', 'Bali'"),
-        brandName: z.string().optional().describe("Cruise line name, e.g. 'Silversea', 'MSC'"),
-        monthFrom: z.string().optional().describe("Start month YYYY-MM, e.g. '2027-07'"),
-        minNights: z.number().optional().describe("Minimum nights"),
-        maxNights: z.number().optional().describe("Maximum nights"),
-        maxPrice: z.number().optional().describe("Max price per person USD"),
+        viaCountryCode: z.string().optional().describe("ISO 3166-1 alpha-2 code of a country the voyage visits/passes through. Use this when user asks for voyages 'in Japan' (JP), 'to Greece' (GR), 'visiting Italy' (IT), etc."),
+        viaCity: z.string().optional().describe("A city or port the voyage visits, in English. Use this when user asks for a specific place like 'Santorini', 'Bali', 'Tokyo', 'Dubrovnik'."),
+        brandName: z.string().optional().describe("Cruise line/brand name, e.g. 'Silversea', 'MSC', 'Ponant', 'Viking'"),
+        monthFrom: z.string().optional().describe("Start month in YYYY-MM format, e.g. '2027-07'. Use this when user says 'in July 2027' or 'next summer'."),
+        minNights: z.number().optional().describe("Minimum number of nights"),
+        maxNights: z.number().optional().describe("Maximum number of nights"),
+        maxPrice: z.number().optional().describe("Maximum price per person in USD"),
+        locale: z.string().optional().describe("Language code for localized results. ALWAYS pass this based on the user's language. Supported: en, zh-TW, zh-CN, ja, ko, ar, tr, he, fa, th, vi, ms, id, hi, ta, de, fr, es, it, pt, nl, no, ru, bn, ur, fil, sw, pl, uk, mn. Examples: Chinese user → 'zh-TW', Japanese → 'ja', French → 'fr', Korean → 'ko'."),
       },
       annotations: readOnlyAnnotations,
       _meta: {
@@ -327,13 +578,14 @@ function createMcpServer(env: Env) {
     "searchShips",
     {
       title: "Search Ships",
-      description: "Search cruise ships by name, brand, type, or passenger capacity. Returns ship specs with links to siloah.travel.",
+      description: "Search cruise ships by name, brand, type, or passenger capacity with multilingual support (30 languages). IMPORTANT: Always pass the 'locale' parameter matching the user's language.",
       inputSchema: {
         name: z.string().optional().describe("Ship name, e.g. 'Silver Nova'"),
         brandName: z.string().optional().describe("Cruise line, e.g. 'Silversea'"),
         shipType: z.string().optional().describe("Type: 'ocean', 'river', 'expedition'"),
         minPassengers: z.number().optional().describe("Min passenger capacity"),
         maxPassengers: z.number().optional().describe("Max passenger capacity"),
+        locale: z.string().optional().describe("Language code for localized results. ALWAYS pass this based on the user's language. Supported: en, zh-TW, zh-CN, ja, ko, ar, tr, he, fa, th, vi, ms, id, hi, ta, de, fr, es, it, pt, nl, no, ru, bn, ur, fil, sw, pl, uk, mn."),
       },
       annotations: readOnlyAnnotations,
       _meta: {
@@ -529,6 +781,7 @@ export default {
         minNights: p.get("minNights") ? parseInt(p.get("minNights")!) : undefined,
         maxNights: p.get("maxNights") ? parseInt(p.get("maxNights")!) : undefined,
         maxPrice: p.get("maxPrice") ? parseFloat(p.get("maxPrice")!) : undefined,
+        locale: p.get("locale") || undefined,
       }).then(jsonResponse)
     }
 
@@ -548,6 +801,7 @@ export default {
         shipType: p.get("shipType") || undefined,
         minPassengers: p.get("minPassengers") ? parseInt(p.get("minPassengers")!) : undefined,
         maxPassengers: p.get("maxPassengers") ? parseInt(p.get("maxPassengers")!) : undefined,
+        locale: p.get("locale") || undefined,
       }).then(jsonResponse)
     }
 
