@@ -1,0 +1,23 @@
+{
+  "name": "siloah-mcp-widgets",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "node build.mjs --watch"
+  },
+  "dependencies": {
+    "@openai/apps-sdk-ui": "latest",
+    "embla-carousel-react": "^8.6.0",
+    "lucide-react": "^0.500.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.2"
+  }
+}

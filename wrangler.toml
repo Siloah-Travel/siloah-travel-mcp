@@ -3,6 +3,11 @@ main = "src/index.ts"
 compatibility_date = "2025-04-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Import .html files as text modules
+[[rules]]
+type = "Text"
+globs = ["**/*.html"]
+
 [vars]
 SUPABASE_URL = "https://qsfwktybcgxqjigwbyzf.supabase.co"
 # SUPABASE_ANON_KEY and OPENAI_API_KEY set via `wrangler secret put`

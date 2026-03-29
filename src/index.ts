@@ -14,6 +14,8 @@ import { registerAppTool, registerAppResource, RESOURCE_MIME_TYPE } from "@model
 import { createClient } from "@supabase/supabase-js"
 import OpenAI from "openai"
 import { z } from "zod"
+import VOYAGES_WIDGET_HTML from "../web/dist/voyages.html"
+import SHIPS_WIDGET_HTML from "../web/dist/ships.html"
 
 interface Env {
   SUPABASE_URL: string
@@ -195,86 +197,10 @@ async function searchByContent(env: Env, params: { query: string; source?: strin
   }
 }
 
-// --- Widget HTML (inline for Cloudflare Workers) ---
+// --- Widget URIs ---
 
 const VOYAGES_WIDGET_URI = "ui://siloah/voyages.html"
-
-function getVoyagesWidgetHtml(): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:var(--font-sans,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif);background:transparent;color:var(--color-text-primary,#1a1a2e);line-height:1.5}
-.container{padding:8px 0}
-.cards{display:flex;flex-direction:column;gap:12px}
-.card{display:flex;border-radius:var(--border-radius-lg,12px);overflow:hidden;border:1px solid var(--color-border-secondary,#e5e4df);background:var(--color-background-primary,#fff);box-shadow:var(--shadow-sm,0 1px 3px rgba(0,0,0,.08));transition:box-shadow .2s;text-decoration:none;color:inherit;cursor:pointer;min-height:140px}
-.card:hover{box-shadow:var(--shadow-md,0 4px 12px rgba(0,0,0,.12))}
-.card-image{width:180px;min-width:180px;background:#0c1b3a;position:relative;overflow:hidden}
-.card-image img{width:100%;height:100%;object-fit:cover;display:block}
-.card-image .placeholder{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.3);font-size:32px}
-.price-badge{position:absolute;bottom:8px;left:8px;background:rgba(12,27,58,.85);backdrop-filter:blur(8px);color:#d4aa4f;font-size:13px;font-weight:600;padding:3px 10px;border-radius:6px;letter-spacing:.02em}
-.price-badge .from{font-size:10px;font-weight:400;color:rgba(255,255,255,.6);margin-right:2px;text-transform:uppercase;letter-spacing:.05em}
-.card-body{flex:1;padding:14px 16px;display:flex;flex-direction:column;justify-content:space-between;min-width:0}
-.card-title{font-size:var(--font-text-md-size,14px);font-weight:var(--font-weight-semibold,600);line-height:1.3;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
-.card-ship{font-size:var(--font-text-sm-size,12px);color:var(--color-text-secondary,#6b7280);margin-bottom:8px;text-transform:capitalize}
-.card-meta{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
-.meta-tag{font-size:11px;padding:2px 8px;border-radius:4px;background:var(--color-background-secondary,#f5f5f0);color:var(--color-text-secondary,#6b7280);white-space:nowrap}
-.card-destinations{font-size:11px;color:var(--color-text-tertiary,#9ca3af);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.card-link{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#0c1b3a;font-weight:500;text-decoration:none;margin-top:6px}
-.card-link:hover{text-decoration:underline}
-.card-link svg{width:14px;height:14px}
-.summary{font-size:var(--font-text-sm-size,13px);color:var(--color-text-secondary,#6b7280);padding:4px 0 8px}
-.empty{text-align:center;padding:24px;color:var(--color-text-tertiary,#9ca3af);font-size:14px}
-@media(max-width:420px){.card{flex-direction:column}.card-image{width:100%;min-width:100%;height:160px}}
-</style>
-</head>
-<body>
-<div class="container" id="root"><div class="empty">Loading voyages…</div></div>
-<script>
-// ChatGPT shortcut: window.openai.toolOutput has data immediately
-if(window.openai&&window.openai.toolOutput){renderVoyages(window.openai.toolOutput)}
-// ChatGPT event: openai:set_globals fires when data arrives
-window.addEventListener("openai:set_globals",function(e){
-  var d=e.detail&&e.detail.globals&&e.detail.globals.toolOutput;
-  if(d)renderVoyages(d);
-},{passive:true});
-// MCP Apps bridge: ui/notifications/tool-result (standard)
-window.addEventListener("message",function(e){
-  var m=e.data;if(!m||m.jsonrpc!=="2.0")return;
-  if(m.method==="ui/notifications/tool-result"){
-    var d=m.params&&m.params.structuredContent;
-    if(d)renderVoyages(d);
-  }
-},{passive:true});
-function renderVoyages(data){
-  var root=document.getElementById("root"),vs=data.voyages||[];
-  if(!vs.length){root.innerHTML='<div class="empty">No voyages found.</div>';return}
-  var txt=data.total>vs.length?"Showing "+vs.length+" of "+data.total.toLocaleString()+" voyages":vs.length+" voyage"+(vs.length>1?"s":"")+" found";
-  root.innerHTML='<div class="summary">'+txt+'</div><div class="cards">'+vs.map(voyageCard).join("")+'</div>';
-  reportSize();
-}
-function voyageCard(v){
-  var date=v.sailDate?fmtDate(v.sailDate):"",nights=v.nights?v.nights+" nights":"",
-    dests=Array.isArray(v.destinations)?v.destinations.slice(0,5).join(" \\u00b7 "):"",
-    price=v.price?"$"+Number(v.price).toLocaleString():null,ship=v.shipName||"",
-    img=v.image?'<img src="'+esc(v.image)+'" alt="'+esc(v.name)+'" loading="lazy">':'<div class="placeholder">\\u2693</div>',
-    pb=price?'<div class="price-badge"><span class="from">from</span> '+price+'</div>':"";
-  return '<a class="card" href="'+esc(v.link)+'" target="_blank" rel="noopener"><div class="card-image">'+img+pb+'</div><div class="card-body"><div><div class="card-title">'+esc(v.name)+'</div>'+(ship?'<div class="card-ship">'+esc(ship)+'</div>':'')+'<div class="card-meta">'+(date?'<span class="meta-tag">'+date+'</span>':'')+(nights?'<span class="meta-tag">'+nights+'</span>':'')+'</div>'+(dests?'<div class="card-destinations">'+esc(dests)+'</div>':'')+'</div><div class="card-link">View details <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg></div></div></a>';
-}
-function fmtDate(s){try{var d=new Date(s+"T00:00:00");return d.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}catch(e){return s}}
-function esc(s){return s?String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"):""}
-function reportSize(){
-  var h=Math.ceil(document.documentElement.getBoundingClientRect().height);
-  window.parent.postMessage({jsonrpc:"2.0",method:"ui/notifications/size-changed",params:{height:h}},"*");
-}
-new ResizeObserver(reportSize).observe(document.documentElement);
-</script>
-</body>
-</html>`
-}
+const SHIPS_WIDGET_URI = "ui://siloah/ships.html"
 
 // --- Create MCP server with tools ---
 
@@ -300,7 +226,30 @@ function createMcpServer(env: Env) {
       contents: [{
         uri: VOYAGES_WIDGET_URI,
         mimeType: RESOURCE_MIME_TYPE,
-        text: getVoyagesWidgetHtml(),
+        text: VOYAGES_WIDGET_HTML,
+        _meta: {
+          ui: {
+            prefersBorder: true,
+            csp: {
+              resourceDomains: ["https://media.siloah.travel"],
+            },
+          },
+        },
+      }],
+    })
+  )
+
+  // --- Register UI resource for ship cards ---
+  registerAppResource(
+    server,
+    "Ship Cards",
+    SHIPS_WIDGET_URI,
+    { description: "Interactive ship search results displayed as rich cards" },
+    async () => ({
+      contents: [{
+        uri: SHIPS_WIDGET_URI,
+        mimeType: RESOURCE_MIME_TYPE,
+        text: SHIPS_WIDGET_HTML,
         _meta: {
           ui: {
             prefersBorder: true,
@@ -372,7 +321,7 @@ function createMcpServer(env: Env) {
     }
   )
 
-  // --- searchShips (text-only, no widget yet) ---
+  // --- searchShips (with widget UI) ---
   registerAppTool(
     server,
     "searchShips",
@@ -387,11 +336,18 @@ function createMcpServer(env: Env) {
         maxPassengers: z.number().optional().describe("Max passenger capacity"),
       },
       annotations: readOnlyAnnotations,
-      _meta: {},
+      _meta: {
+        ui: { resourceUri: SHIPS_WIDGET_URI },
+        "openai/toolInvocation/invoking": "Searching cruise ships…",
+        "openai/toolInvocation/invoked": "Ships found.",
+      },
     },
     async (params) => {
       const result = await searchShips(env, params)
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] }
+      return {
+        structuredContent: result as Record<string, unknown>,
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      }
     }
   )
 
