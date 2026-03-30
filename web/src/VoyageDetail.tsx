@@ -1,13 +1,13 @@
-import { Ship as ShipIcon, Calendar, Moon, MapPin, Anchor, ExternalLink, Navigation, Clock, Waves, Users, Layers, Star, Play } from "lucide-react"
+import { Ship as ShipIcon, Calendar, Moon, MapPin, Anchor, Navigation, Clock, Waves, Users, Layers, Star, Play, Accessibility, ImageOff, ChevronRight } from "lucide-react"
 import { t, translateDest } from "./i18n"
-import type { Voyage, ItineraryStop } from "./voyages"
+import type { Voyage, ItineraryStop, VoyageCabin } from "./voyages"
 
 export function VoyageDetail({ voyage: v }: { voyage: Voyage }) {
   const price = v.price ? `$${Number(v.price).toLocaleString()}` : null
   const hasItinerary = v.itinerary && v.itinerary.length > 0
 
   return (
-    <div style={{ maxWidth: 900, margin: "0 auto" }}>
+    <div style={{ maxWidth: 900, margin: "0 auto", paddingBottom: 100 }}>
       {/* Hero image */}
       <div style={styles.hero}>
         {v.image ? (
@@ -65,7 +65,7 @@ export function VoyageDetail({ voyage: v }: { voyage: Voyage }) {
       {(v.brand || v.ship) && (
         <div style={styles.section}>
           {/* YouTube video (LiteYouTube facade) */}
-          {v.ship?.videoUrl && <LiteYouTube url={v.ship.videoUrl} />}
+          {v.ship?.videoUrl && <LiteYouTube url={v.ship.videoUrl} voyageLink={v.link} />}
           <div style={styles.shipBrandCard}>
             {/* Ship image */}
             {v.shipImage && (
@@ -157,19 +157,40 @@ export function VoyageDetail({ voyage: v }: { voyage: Voyage }) {
         )}
       </div>
 
-      {/* CTA */}
-      <div style={styles.ctaSection}>
-        <a
-          href={v.link}
-          target="_blank"
-          rel="noopener noreferrer"
-          style={styles.ctaButton}
-          onClick={() => window.openai?.openExternal({ href: v.link })}
-        >
-          {t("view_full")}
-          <ExternalLink size={14} />
-        </a>
-        <div style={styles.ctaSubtext}>{t("cta_subtitle")}</div>
+      {/* Cabin Options & Pricing */}
+      {v.cabins && v.cabins.length > 0 && (
+        <div style={styles.section}>
+          <h2 style={{ ...styles.sectionTitle, marginBottom: 16 }}>{t("cabin_pricing")}</h2>
+          <div style={{ display: "flex", flexDirection: "column" as const, gap: 12 }}>
+            {v.cabins.map((cabin, i) => (
+              <CabinCard key={i} cabin={cabin} voyageLink={v.link} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Contact CTA — dark navy glassmorphism panel */}
+      <div style={styles.section}>
+        <div style={styles.contactCta}>
+          <h2 style={styles.contactCtaHeading}>{t("cta_heading")}</h2>
+          <p style={styles.contactCtaDesc}>{t("cta_description")}</p>
+          {price && (
+            <div style={styles.contactCtaPrice}>
+              <span style={{ fontSize: 12, color: "rgba(255,255,255,0.5)", marginRight: 4 }}>{t("from_price").toUpperCase()}</span>
+              {price}
+              <span style={{ fontSize: 12, color: "rgba(255,255,255,0.5)", marginLeft: 4 }}>{t("per_person")}</span>
+            </div>
+          )}
+          <button
+            style={styles.contactCtaButton}
+            onClick={() => window.openai?.openExternal({ href: v.link })}
+          >
+            {t("cta_book")}
+          </button>
+          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", marginTop: 10 }}>
+            siloah.travel
+          </div>
+        </div>
       </div>
     </div>
   )
@@ -246,7 +267,7 @@ function ItineraryCard({ stop, isFirst, isLast }: {
                 src={stop.image}
                 alt={stop.portName}
                 style={{
-                  width: 160, minWidth: 160, height: "auto", minHeight: 100,
+                  width: "45%", minWidth: "45%", aspectRatio: "16/9",
                   objectFit: "cover", display: "block", flexShrink: 0,
                 }}
               />
@@ -313,6 +334,109 @@ function TimelineItem({ day, port, type }: {
   )
 }
 
+/* --- Cabin Card --- */
+
+function CabinCard({ cabin, voyageLink }: { cabin: VoyageCabin; voyageLink: string }) {
+  const isSuite = cabin.type === "Suite"
+  const typeKey = `cabin_${cabin.type.toLowerCase()}` as string
+  const typeLabel = t(typeKey)
+
+  const sizeText = (() => {
+    if (cabin.sizeMin && cabin.sizeMax && cabin.sizeMin !== cabin.sizeMax) {
+      return t("cabin_sqft", { min: cabin.sizeMin, max: cabin.sizeMax })
+    }
+    const s = cabin.sizeMax ?? cabin.sizeMin
+    if (s) return t("cabin_sqft_single", { size: s })
+    return null
+  })()
+
+  return (
+    <div
+      style={styles.cabinCard}
+      role="button"
+      tabIndex={0}
+      onClick={() => window.openai?.openExternal({ href: voyageLink })}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") window.openai?.openExternal({ href: voyageLink }) }}
+    >
+      {/* Image (top) */}
+      <div style={styles.cabinImageWrap}>
+        {cabin.image ? (
+          <img src={cabin.image} alt={cabin.name} style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+        ) : (
+          <div style={styles.cabinImagePlaceholder}>
+            <ImageOff size={28} color="rgba(255,255,255,0.15)" />
+          </div>
+        )}
+      </div>
+
+      {/* Info (bottom) */}
+      <div style={styles.cabinBody}>
+        {/* Name + type badge */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+          <div style={{ fontSize: 15, fontWeight: 700, color: "#1a1a2e", flex: 1 }}>
+            {cabin.name}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+            {cabin.accessible && <Accessibility size={13} color="rgba(12,27,58,0.5)" />}
+            <span style={{
+              padding: "3px 10px", fontSize: 11, fontWeight: 600, borderRadius: 4,
+              background: isSuite ? "rgba(212,170,79,0.12)" : "rgba(12,27,58,0.06)",
+              color: isSuite ? "#b8923a" : "rgba(12,27,58,0.6)",
+              border: isSuite ? "1px solid rgba(212,170,79,0.25)" : "1px solid rgba(12,27,58,0.1)",
+            }}>
+              {typeLabel}
+            </span>
+          </div>
+        </div>
+
+        {/* Size + occupancy */}
+        <div style={{ display: "flex", gap: 12, fontSize: 12, color: "#6b7280", marginBottom: 8 }}>
+          {sizeText && <span>{sizeText}</span>}
+          {cabin.maxOccupancy && <span>{t("cabin_max_guests", { n: cabin.maxOccupancy })}</span>}
+        </div>
+
+        {/* Description */}
+        {cabin.description && (
+          <p style={{ fontSize: 13, lineHeight: 1.6, color: "#4b5563", margin: "0 0 10px 0" }}>
+            {cabin.description}
+          </p>
+        )}
+
+        {/* Facilities tags */}
+        {cabin.facilities && cabin.facilities.length > 0 && (
+          <div style={{ display: "flex", flexWrap: "wrap" as const, gap: 6, marginBottom: 10 }}>
+            {cabin.facilities.map((f, i) => (
+              <span key={i} style={{
+                fontSize: 11, padding: "2px 8px", borderRadius: 4,
+                background: "#f5f5f0", border: "1px solid rgba(0,0,0,0.04)", color: "#6b7280",
+              }}>
+                {f}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* Price + CTA — pushed to bottom */}
+        <div style={{ marginTop: "auto", paddingTop: 10, borderTop: "1px solid #f0efe9", display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ flex: 1 }}>
+            {cabin.price ? (
+              <span style={{ fontSize: 16, fontWeight: 700, color: "#b8923a" }}>
+                {t("cabin_from_price", { price: Number(cabin.price).toLocaleString() })}
+              </span>
+            ) : (
+              <span style={{ fontSize: 12, color: "#9ca3af" }}>{t("cabin_contact")}</span>
+            )}
+          </div>
+          <span style={styles.cabinCta}>
+            {t("view_details").replace(" →", "")}
+            <ChevronRight size={14} />
+          </span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /* --- LiteYouTube facade --- */
 
 function extractVideoId(url: string): string | null {
@@ -325,47 +449,31 @@ function extractVideoId(url: string): string | null {
   } catch { return null }
 }
 
-function LiteYouTube({ url }: { url: string }) {
+function LiteYouTube({ url, voyageLink }: { url: string; voyageLink: string }) {
   const videoId = extractVideoId(url)
   if (!videoId) return null
 
-  const embedUrl = `https://www.youtube.com/embed/${videoId}?autoplay=1`
-
   return (
     <div style={styles.ytWrap}>
-      {/* Try iframe embed first — if CSP blocks it, the thumbnail still shows */}
-      <div style={styles.ytInner}>
+      <div
+        style={styles.ytInner}
+        role="button"
+        tabIndex={0}
+        aria-label="Watch video on siloah.travel"
+        onClick={() => window.openai?.openExternal({ href: voyageLink })}
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") window.openai?.openExternal({ href: voyageLink }) }}
+      >
         <img
           src={`https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`}
           alt=""
           style={{ width: "100%", height: "100%", objectFit: "cover", position: "absolute", inset: 0 }}
         />
         <div style={styles.ytOverlay} />
-        <a
-          href={url}
-          target="_blank"
-          rel="noopener noreferrer"
-          style={styles.ytPlayBtn}
-          aria-label="Play video"
-          onClick={(e) => {
-            // Try to replace thumbnail with iframe embed
-            const container = e.currentTarget.parentElement
-            if (container) {
-              e.preventDefault()
-              const iframe = document.createElement("iframe")
-              iframe.src = embedUrl
-              iframe.allow = "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-              iframe.allowFullscreen = true
-              iframe.style.cssText = "position:absolute;inset:0;width:100%;height:100%;border:none;"
-              container.innerHTML = ""
-              container.appendChild(iframe)
-            }
-          }}
-        >
+        <div style={styles.ytPlayBtn}>
           <div style={styles.ytPlayCircle}>
             <Play size={28} fill="#0c1b3a" color="#0c1b3a" style={{ marginLeft: 3 }} />
           </div>
-        </a>
+        </div>
       </div>
     </div>
   )
@@ -412,7 +520,7 @@ const styles: Record<string, React.CSSProperties> = {
     background: "#fff", display: "flex", flexDirection: "row" as const,
   },
   shipImageWrap: {
-    width: 200, minWidth: 200, overflow: "hidden", background: "#0c1b3a", flexShrink: 0,
+    width: "45%", minWidth: "45%", overflow: "hidden", background: "#0c1b3a", flexShrink: 0,
   },
   shipBrandBody: {
     flex: 1, padding: "16px 20px", display: "flex", flexDirection: "column" as const,
@@ -500,19 +608,67 @@ const styles: Record<string, React.CSSProperties> = {
   timelinePort: { fontSize: 15, fontWeight: 600, color: "#1a1a2e" },
   timelineType: { fontSize: 11, color: "#d4aa4f", fontWeight: 500 },
 
-  ctaSection: { padding: "24px 32px 40px", textAlign: "center" },
-  ctaButton: {
-    display: "inline-flex", alignItems: "center", gap: 8, padding: "14px 32px", borderRadius: 8,
-    background: "#d4aa4f", color: "#0c1b3a", fontSize: 15, fontWeight: 700, textDecoration: "none",
-    boxShadow: "0 4px 16px rgba(212,170,79,0.3)", cursor: "pointer",
+  /* --- Contact CTA panel --- */
+  contactCta: {
+    background: "rgba(12,27,58,0.85)",
+    backdropFilter: "blur(48px) saturate(1.5)",
+    WebkitBackdropFilter: "blur(48px) saturate(1.5)",
+    borderRadius: 12, padding: "40px 32px", textAlign: "center" as const,
+    border: "1px solid rgba(255,255,255,0.15)",
+    boxShadow: "0 8px 32px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.15)",
   },
-  ctaSubtext: { fontSize: 12, color: "#9ca3af", marginTop: 10 },
+  contactCtaHeading: {
+    fontSize: 22, fontWeight: 700, color: "#fff",
+    margin: "0 0 10px 0", lineHeight: 1.3,
+  },
+  contactCtaDesc: {
+    fontSize: 14, lineHeight: 1.7, color: "rgba(255,255,255,0.7)",
+    margin: "0 0 20px 0", maxWidth: 480, marginLeft: "auto", marginRight: "auto",
+  },
+  contactCtaPrice: {
+    fontSize: 24, fontWeight: 700, color: "#d4aa4f",
+    marginBottom: 20,
+  },
+  contactCtaButton: {
+    display: "inline-flex", alignItems: "center", gap: 6,
+    padding: "10px 28px", borderRadius: 4,
+    background: "#d4aa4f", color: "#0c1b3a",
+    fontSize: 13, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase" as const,
+    border: "none", cursor: "pointer",
+    boxShadow: "0 4px 16px rgba(212,170,79,0.3)",
+  },
+
+  /* --- Cabin cards --- */
+  cabinCard: {
+    display: "flex", flexDirection: "row" as const, overflow: "hidden",
+    borderRadius: 12, border: "1px solid #e5e4df", background: "#fff",
+    cursor: "pointer", transition: "box-shadow 0.2s",
+  },
+  cabinImageWrap: {
+    width: "45%", minWidth: "45%", minHeight: 200, overflow: "hidden", background: "#0c1b3a", flexShrink: 0,
+  },
+  cabinImagePlaceholder: {
+    width: "100%", height: "100%",
+    display: "flex", alignItems: "center", justifyContent: "center",
+    background: "linear-gradient(135deg, #0c1b3a 0%, #1a2d52 100%)",
+  },
+  cabinBody: {
+    flex: 1, padding: "16px 18px", display: "flex", flexDirection: "column" as const,
+    minWidth: 0,
+  },
+  cabinCta: {
+    display: "inline-flex", alignItems: "center", gap: 2, flexShrink: 0,
+    whiteSpace: "nowrap" as const, padding: "6px 14px", borderRadius: 6,
+    background: "rgba(12,27,58,0.85)", color: "#fff",
+    fontSize: 13, fontWeight: 500,
+  },
 
   /* --- YouTube --- */
   ytWrap: { marginBottom: 16 },
   ytInner: {
     position: "relative" as const, paddingBottom: "56.25%", /* 16:9 */
     height: 0, overflow: "hidden", borderRadius: 12, background: "#0c1b3a",
+    cursor: "pointer",
   },
   ytOverlay: {
     position: "absolute" as const, inset: 0,

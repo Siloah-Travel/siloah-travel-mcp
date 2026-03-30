@@ -32,6 +32,19 @@ export interface VoyageShip {
   videoUrl: string | null
 }
 
+export interface VoyageCabin {
+  name: string
+  type: string  // Suite | Balcony | Outside | Inside
+  description: string | null
+  sizeMin: number | null
+  sizeMax: number | null
+  maxOccupancy: number | null
+  accessible: boolean
+  facilities: string[]
+  image: string | null
+  price: number | null
+}
+
 export interface Voyage {
   name: string
   shipName: string
@@ -47,6 +60,7 @@ export interface Voyage {
   itinerary?: ItineraryStop[]
   brand?: VoyageBrand | null
   ship?: VoyageShip | null
+  cabins?: VoyageCabin[]
 }
 
 interface VoyageData {
@@ -108,7 +122,7 @@ function App() {
               ? t("showing_of", { count: data.voyages.length, total: data.total.toLocaleString() })
               : t("voyages_found", { count: data.voyages.length })}
           </div>
-          <div style={styles.sidebarList}>
+          <div className="sidebar-scroll" style={styles.sidebarList}>
             {data.voyages.map((v, i) => (
               <SidebarItem
                 key={i}
@@ -124,7 +138,7 @@ function App() {
             ))}
           </div>
         </div>
-        <div style={styles.detailPanel}>
+        <div className="detail-scroll" style={styles.detailPanel}>
           <VoyageDetail voyage={selected} />
         </div>
       </div>

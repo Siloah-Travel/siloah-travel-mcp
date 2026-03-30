@@ -97,16 +97,13 @@ function VoyageCard({ voyage: v, onClick }: { voyage: Voyage; onClick?: () => vo
   const price = v.price ? `$${Number(v.price).toLocaleString()}` : null
   const dests = Array.isArray(v.destinations) ? v.destinations.slice(0, 4).join(" · ") : ""
 
-  const handleClick = (e: React.MouseEvent) => {
-    if (onClick) { e.preventDefault(); onClick() }
-  }
-
   return (
-    <a
-      href={v.link}
-      target="_blank"
-      rel="noopener noreferrer"
-      onClick={handleClick}
+    <div
+      onClick={onClick}
+      role="button"
+      tabIndex={0}
+      aria-label={v.name}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onClick?.() }}
       style={{
         flex: "0 0 260px",
         borderRadius: 12,
@@ -190,7 +187,7 @@ function VoyageCard({ voyage: v, onClick }: { voyage: Voyage; onClick?: () => vo
           {t("view_details")}
         </div>
       </div>
-    </a>
+    </div>
   )
 }
 

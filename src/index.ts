@@ -124,6 +124,24 @@ async function searchVoyages(env: Env, params: {
     .not("source_url", "is", null)
     .limit(50)
 
+  // Cabin types per ship (one representative per cabin_type per ship)
+  const cabinTypesPromise = db.from("cabin_types")
+    .select("id, ship_id, cabin_name, cabin_type, accommodation_class, cabin_size_min, cabin_size_max, max_occupancy, accessible, description, facilities")
+    .in("ship_id", shipIds)
+    .order("ship_id")
+    .order("accommodation_class")
+    .order("cabin_name")
+    .limit(300)
+
+  // Cabin prices per voyage (cheapest per cabin_type)
+  const cabinPricesPromise = db.from("cruise_prices")
+    .select("cruise_id, cabin_type, price")
+    .in("cruise_id", voyageIds)
+    .not("price", "is", null)
+    .gt("price", 0)
+    .order("price", { ascending: true })
+    .limit(500)
+
   // Ship/brand name translations
   const shipNameTransPromise = locale
     ? db.from("translations").select("record_id, value")
@@ -136,8 +154,8 @@ async function searchVoyages(env: Env, params: {
         .in("record_id", lineIds)
     : Promise.resolve({ data: null })
 
-  const [nameTransResult, itinResult, shipsResult, brandsResult, shipPhotoResult, shipVideoResult, shipNameTransResult, brandNameTransResult] =
-    await Promise.all([nameTransPromise, itinPromise, shipsPromise, brandsPromise, shipPhotoPromise, shipVideoPromise, shipNameTransPromise, brandNameTransPromise])
+  const [nameTransResult, itinResult, shipsResult, brandsResult, shipPhotoResult, shipVideoResult, cabinTypesResult, cabinPricesResult, shipNameTransResult, brandNameTransResult] =
+    await Promise.all([nameTransPromise, itinPromise, shipsPromise, brandsPromise, shipPhotoPromise, shipVideoPromise, cabinTypesPromise, cabinPricesPromise, shipNameTransPromise, brandNameTransPromise])
 
   const nameMap: Record<string, string> = {}
   if (nameTransResult.data) for (const t of nameTransResult.data) nameMap[t.record_id] = t.value
@@ -173,6 +191,81 @@ async function searchVoyages(env: Env, params: {
   if (shipNameTransResult.data) for (const t of shipNameTransResult.data) shipNameMap[t.record_id] = t.value
   const brandNameMap: Record<string, string> = {}
   if (brandNameTransResult.data) for (const t of brandNameTransResult.data) brandNameMap[t.record_id] = t.value
+
+  // --- Cabin data processing ---
+  // Pick one representative cabin per (ship_id, accommodation_class)
+  type CabinRow = { id: string; ship_id: string; cabin_name: string; cabin_type: string | null; accommodation_class: string | null; cabin_size_min: number | null; cabin_size_max: number | null; max_occupancy: number | null; accessible: boolean; description: string | null; facilities: string[] | null }
+  const cabinsByShip: Record<string, CabinRow[]> = {}
+  const cabinIdSet = new Set<string>()
+  if (cabinTypesResult.data) {
+    const seen = new Set<string>()
+    for (const c of cabinTypesResult.data as CabinRow[]) {
+      const cls = c.accommodation_class || c.cabin_type || "Inside"
+      const key = `${c.ship_id}_${cls}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      ;(cabinsByShip[c.ship_id] ??= []).push(c)
+      cabinIdSet.add(c.id)
+    }
+  }
+
+  // Cheapest price per (cruise_id, cabin_type)
+  type PriceRow = { cruise_id: string; cabin_type: string; price: number }
+  const cheapestByVoyageType: Record<string, Record<string, number>> = {}
+  if (cabinPricesResult.data) {
+    for (const p of cabinPricesResult.data as PriceRow[]) {
+      const ct = (p.cabin_type || "").toLowerCase()
+      const cls = ct.includes("suite") ? "Suite" : ct.includes("balcon") ? "Balcony" : ct.includes("outside") || ct.includes("ocean") ? "Outside" : "Inside"
+      if (!cheapestByVoyageType[p.cruise_id]) cheapestByVoyageType[p.cruise_id] = {}
+      if (!cheapestByVoyageType[p.cruise_id][cls] || p.price < cheapestByVoyageType[p.cruise_id][cls]) {
+        cheapestByVoyageType[p.cruise_id][cls] = p.price
+      }
+    }
+  }
+
+  // Second batch: cabin images + cabin name/description translations
+  const cabinIds = [...cabinIdSet]
+  let cabinImageMap: Record<string, string> = {}
+  let cabinNameTransMap: Record<string, string> = {}
+  let cabinDescTransMap: Record<string, string> = {}
+
+  if (cabinIds.length > 0) {
+    const cabinImagePromise = db.from("cruise_media")
+      .select("entity_id, r2_key")
+      .eq("entity_type", "cabin_type")
+      .in("entity_id", cabinIds)
+      .not("r2_key", "is", null)
+      .in("role", ["default", "cover", "gallery"])
+      .order("role")
+      .order("sort_order")
+      .limit(100)
+
+    const cabinNameTransPromise = locale
+      ? db.from("translations").select("record_id, value")
+          .eq("table_name", "cabin_types").eq("locale", locale).eq("field_name", "cabin_name")
+          .in("record_id", cabinIds)
+      : Promise.resolve({ data: null })
+
+    const cabinDescTransPromise = locale
+      ? db.from("translations").select("record_id, value")
+          .eq("table_name", "cabin_types").eq("locale", locale).eq("field_name", "description")
+          .in("record_id", cabinIds)
+      : Promise.resolve({ data: null })
+
+    const [cabinImageResult, cabinNameTransResult, cabinDescTransResult] = await Promise.all([cabinImagePromise, cabinNameTransPromise, cabinDescTransPromise])
+
+    if (cabinImageResult.data) {
+      for (const m of cabinImageResult.data) {
+        if (!cabinImageMap[m.entity_id]) cabinImageMap[m.entity_id] = m.r2_key
+      }
+    }
+    if (cabinNameTransResult.data) {
+      for (const t of cabinNameTransResult.data) cabinNameTransMap[t.record_id] = t.value
+    }
+    if (cabinDescTransResult.data) {
+      for (const t of cabinDescTransResult.data) cabinDescTransMap[t.record_id] = t.value
+    }
+  }
 
   // Group itineraries by cruise_id
   type ItinRow = { cruise_id: string; day: number; order_id: number; port_name: string; canonical_port_id: string | null; arrive_time: string | null; depart_time: string | null }
@@ -300,7 +393,7 @@ async function searchVoyages(env: Env, params: {
         destinations: v.destinations,
         image: v.cover_image ? `${R2}/${v.cover_image}` : null,
         shipImage: v.ship_image ? `${R2}/${v.ship_image}` : (shipPhotoMap[sId] ? `${R2}/${shipPhotoMap[sId].replace("/lg/", "/sm/")}` : null),
-        link: `https://siloah.travel/cruise/voyages/${slug}`,
+        link: `https://siloah.travel${locale ? `/${locale}` : ""}/cruise/voyages/${slug}`,
         itinerary,
         // Ship & brand details
         brand: brand ? {
@@ -317,6 +410,33 @@ async function searchVoyages(env: Env, params: {
           type: ship.ship_type,
           videoUrl: shipVideoMap[sId] ?? null,
         } : null,
+        // Cabin types with prices
+        cabins: (() => {
+          const shipCabins = cabinsByShip[sId] ?? []
+          const voyagePrices = cheapestByVoyageType[cruiseId] ?? {}
+          const CLASS_ORDER = ["Suite", "Balcony", "Outside", "Inside"]
+          return shipCabins
+            .map((c) => {
+              const cls = c.accommodation_class || c.cabin_type || "Inside"
+              const normalizedCls = cls.includes("Suite") ? "Suite" : cls.includes("Balcon") ? "Balcony" : cls.includes("Outside") || cls.includes("Ocean") ? "Outside" : "Inside"
+              // Strip HTML tags from description for plain text display
+              const rawDesc = cabinDescTransMap[c.id] ?? c.description ?? ""
+              const plainDesc = rawDesc.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").trim()
+              return {
+                name: cabinNameTransMap[c.id] ?? c.cabin_name,
+                type: normalizedCls,
+                description: plainDesc.length > 300 ? plainDesc.slice(0, 300) + "…" : plainDesc || null,
+                sizeMin: c.cabin_size_min,
+                sizeMax: c.cabin_size_max,
+                maxOccupancy: c.max_occupancy,
+                accessible: c.accessible,
+                facilities: c.facilities?.slice(0, 6) ?? [],
+                image: cabinImageMap[c.id] ? `${R2}/${cabinImageMap[c.id].replace("/lg/", "/sm/")}` : null,
+                price: voyagePrices[normalizedCls] ?? null,
+              }
+            })
+            .sort((a, b) => CLASS_ORDER.indexOf(a.type) - CLASS_ORDER.indexOf(b.type))
+        })(),
       }
     }),
   }
