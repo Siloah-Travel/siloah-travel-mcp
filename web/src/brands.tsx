@@ -1,43 +1,34 @@
 import { createRoot } from "react-dom/client"
 import { useState, useCallback } from "react"
 import { useToolOutput, useAutoResize, useDisplayMode } from "./hooks"
-import { ShipCarousel } from "./ShipCarousel"
-import { ShipDetail } from "./ShipDetail"
+import { BrandCarousel } from "./BrandCarousel"
+import { BrandDetail } from "./BrandDetail"
 import { setLocale, t } from "./i18n"
-import { ChevronLeft, Ship, Star, Users, Anchor } from "lucide-react"
+import { ChevronLeft, Anchor } from "lucide-react"
 
-export interface ShipCabin {
+export interface BrandShip {
   name: string
-  type: string
-  description: string | null
-  sizeMin: number | null
-  sizeMax: number | null
-  maxOccupancy: number | null
-  accessible: boolean
-  facilities: string[]
-  image: string | null
-}
-
-export interface Ship {
-  name: string
-  brand: string
-  brandLogo: string | null
-  tonnage: number | null
-  passengers: number | null
-  cabins: number | null
-  launched: string | null
   type: string | null
+  passengers: number | null
   starRating: number | null
-  cruiseCount: number
   image: string | null
-  videoUrl: string | null
   link: string
-  cabinTypes: ShipCabin[]
 }
 
-interface ShipData {
+export interface Brand {
+  name: string
+  tier: string | null
+  description: string
+  shipCount: number
+  cruiseCount: number
+  logo: string | null
+  link: string
+  ships: BrandShip[]
+}
+
+interface BrandData {
   locale?: string
-  ships: Ship[]
+  brands: Brand[]
 }
 
 interface WidgetState {
@@ -46,7 +37,7 @@ interface WidgetState {
 }
 
 function App() {
-  const data = useToolOutput<ShipData>()
+  const data = useToolOutput<BrandData>()
   const displayMode = useDisplayMode()
   useAutoResize()
 
@@ -57,7 +48,7 @@ function App() {
     return saved?.view ? saved : { view: "carousel", selectedIndex: 0 }
   })
 
-  const selectShip = useCallback(async (index: number) => {
+  const selectBrand = useCallback(async (index: number) => {
     const newState: WidgetState = { view: "detail", selectedIndex: index }
     setState(newState)
     window.openai?.setWidgetState(newState)
@@ -72,15 +63,15 @@ function App() {
   }, [])
 
   if (!data) {
-    return <div style={styles.empty}>{t("loading_ships")}</div>
+    return <div style={styles.empty}>{t("loading_brands")}</div>
   }
-  if (!data.ships?.length) {
-    return <div style={styles.empty}>{t("no_ships")}</div>
+  if (!data.brands?.length) {
+    return <div style={styles.empty}>{t("no_brands")}</div>
   }
 
   // Fullscreen master-detail
   if (state.view === "detail" && displayMode === "fullscreen") {
-    const selected = data.ships[state.selectedIndex] ?? data.ships[0]
+    const selected = data.brands[state.selectedIndex] ?? data.brands[0]
     return (
       <div style={styles.fullscreen}>
         <div style={styles.sidebar}>
@@ -88,13 +79,13 @@ function App() {
             <ChevronLeft size={16} /> {t("back_to_chat")}
           </button>
           <div style={styles.sidebarTitle}>
-            {t("ships_found", { count: data.ships.length })}
+            {t("brands_found", { count: data.brands.length })}
           </div>
           <div style={styles.sidebarList}>
-            {data.ships.map((s, i) => (
+            {data.brands.map((b, i) => (
               <SidebarItem
                 key={i}
-                ship={s}
+                brand={b}
                 selected={i === state.selectedIndex}
                 onClick={() => {
                   const newState: WidgetState = { view: "detail", selectedIndex: i }
@@ -106,7 +97,7 @@ function App() {
           </div>
         </div>
         <div style={styles.detailPanel}>
-          <ShipDetail ship={selected} />
+          <BrandDetail brand={selected} />
         </div>
       </div>
     )
@@ -116,16 +107,17 @@ function App() {
   return (
     <div style={{ padding: "8px 0" }}>
       <div style={{ fontSize: 13, color: "#6b7280", marginBottom: 8 }}>
-        {t("ships_found", { count: data.ships.length })}
+        {t("brands_found", { count: data.brands.length })}
       </div>
-      <ShipCarousel ships={data.ships} onSelectShip={selectShip} />
+      <BrandCarousel brands={data.brands} onSelectBrand={selectBrand} />
     </div>
   )
 }
 
-function SidebarItem({ ship: s, selected, onClick }: {
-  ship: Ship; selected: boolean; onClick: () => void
+function SidebarItem({ brand: b, selected, onClick }: {
+  brand: Brand; selected: boolean; onClick: () => void
 }) {
+  const tierKey = b.tier ? `tier_${b.tier}` : null
   return (
     <button
       onClick={onClick}
@@ -136,29 +128,22 @@ function SidebarItem({ ship: s, selected, onClick }: {
       }}
     >
       <div style={styles.sidebarThumb}>
-        {s.image ? (
-          <img src={s.image} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+        {b.ships?.find((s) => s.image)?.image ? (
+          <img src={b.ships.find((s) => s.image)!.image!} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+        ) : b.logo ? (
+          <img src={b.logo} alt="" style={{ width: "80%", height: "80%", objectFit: "contain", filter: "brightness(0) invert(1)" }} />
         ) : (
           <Anchor size={20} color="rgba(255,255,255,0.3)" />
         )}
       </div>
       <div style={styles.sidebarItemBody}>
-        <div style={styles.sidebarItemTitle}>{s.name}</div>
+        <div style={styles.sidebarItemTitle}>{b.name}</div>
+        {tierKey && (
+          <div style={styles.sidebarItemMeta}>{t(tierKey)}</div>
+        )}
         <div style={styles.sidebarItemMeta}>
-          <Ship size={11} /> {s.brand}
+          {b.shipCount} {t("ships_label")} · {b.cruiseCount} {t("cruises_label")}
         </div>
-        {s.starRating && s.starRating > 0 && (
-          <div style={{ display: "flex", gap: 1, marginTop: 2 }}>
-            {Array.from({ length: Math.round(s.starRating) }).map((_, i) => (
-              <Star key={i} size={10} fill="#d4aa4f" color="#d4aa4f" />
-            ))}
-          </div>
-        )}
-        {s.passengers && (
-          <div style={styles.sidebarItemMeta}>
-            <Users size={11} /> {s.passengers.toLocaleString()} guests
-          </div>
-        )}
       </div>
     </button>
   )

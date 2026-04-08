@@ -1,7 +1,7 @@
 import * as esbuild from "esbuild"
 import { readFileSync, writeFileSync, mkdirSync } from "fs"
 
-const widgets = ["voyages", "ships"]
+const widgets = ["voyages", "ships", "brands"]
 
 async function build() {
   for (const widget of widgets) {
@@ -33,7 +33,7 @@ async function build() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<style>${css}</style>
+<style>html,body{margin:0;overflow:hidden}body{overflow-y:auto;scrollbar-width:none}body::-webkit-scrollbar{display:none}${css}</style>
 </head>
 <body>
 <div id="root"></div>

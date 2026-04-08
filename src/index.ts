@@ -16,6 +16,7 @@ import OpenAI from "openai"
 import { z } from "zod"
 import VOYAGES_WIDGET_HTML from "../web/dist/voyages.html"
 import SHIPS_WIDGET_HTML from "../web/dist/ships.html"
+import BRANDS_WIDGET_HTML from "../web/dist/brands.html"
 
 interface Env {
   SUPABASE_URL: string
@@ -39,6 +40,15 @@ function normalizeLocale(raw?: string): string | null {
   return LOCALE_ALIASES[lc] ?? raw
 }
 
+// --- Helpers ---
+const CLASS_ORDER = ["Suite", "Balcony", "Outside", "Inside"]
+function normalizeCls(cls: string): string {
+  return cls.includes("Suite") || cls.includes("suite") ? "Suite"
+    : cls.includes("Balcon") || cls.includes("balcon") ? "Balcony"
+    : cls.includes("Outside") || cls.includes("outside") || cls.includes("Ocean") || cls.includes("ocean") ? "Outside"
+    : "Inside"
+}
+
 // --- Tool implementations ---
 
 async function searchVoyages(env: Env, params: {
@@ -59,7 +69,7 @@ async function searchVoyages(env: Env, params: {
   const db = getDb(env)
   const locale = normalizeLocale(params.locale)
 
-  // Single RPC call — brand name resolution + slug retrieval all inside the RPC
+  // Use get_voyage_list v2 RPC (replaces search_voyages — same params, full translations)
   const rpcParams: Record<string, unknown> = { p_limit: 20, p_offset: 0, p_skip_count: true }
   if (locale) rpcParams.p_locale = locale
   if (params.brandName) rpcParams.p_brand_name = params.brandName
@@ -75,316 +85,160 @@ async function searchVoyages(env: Env, params: {
   if (params.viaCountryCode) rpcParams.p_via_iso = params.viaCountryCode
   if (params.viaCity) rpcParams.p_via_port_name = params.viaCity
 
-  const { data: voyages, error } = await db.rpc("search_voyages", rpcParams)
+  const { data: voyages, error } = await db.rpc("get_voyage_list", rpcParams)
   if (error) return { error: error.message }
   if (!voyages || voyages.length === 0) return { total: 0, locale: locale ?? "en", voyages: [] }
 
   const R2 = "https://media.siloah.travel"
   const voyageIds = voyages.map((v: Record<string, unknown>) => v.id as string)
-  const shipIds = [...new Set(voyages.map((v: Record<string, unknown>) => v.ship_id as string))]
-  const lineIds = [...new Set(voyages.map((v: Record<string, unknown>) => v.line_id as string))]
 
-  // --- Parallel batch queries: name translations + itineraries + ship/brand info ---
-  const nameTransPromise = locale
-    ? db.from("translations").select("record_id, value")
-        .eq("table_name", "cruises").eq("locale", locale).eq("field_name", "name")
-        .in("record_id", voyageIds)
+  // --- Round 1: get_voyage_detail v2 for all voyages in parallel ---
+  const detailResults = await Promise.all(
+    voyageIds.map((id) => db.rpc("get_voyage_detail", { p_cruise_id: id, p_locale: locale ?? "en" }))
+  )
+  const detailMap: Record<string, Record<string, unknown>> = {}
+  for (let i = 0; i < voyageIds.length; i++) {
+    if (detailResults[i].data) detailMap[voyageIds[i]] = detailResults[i].data as Record<string, unknown>
+  }
+
+  // Collect IDs for image queries (v2 detail has translations but may not include images)
+  const shipIds = new Set<string>()
+  const cabinIds = new Set<string>()
+  const cpIds = new Set<string>()
+  for (const d of Object.values(detailMap)) {
+    const ship = d.ship as Record<string, unknown> | null
+    if (ship?.id) shipIds.add(ship.id as string)
+    for (const c of (d.cabins ?? []) as Array<Record<string, unknown>>) {
+      if (c.id) cabinIds.add(c.id as string)
+    }
+    for (const it of (d.itinerary ?? []) as Array<Record<string, unknown>>) {
+      if (it.cp_id) cpIds.add(it.cp_id as string)
+    }
+  }
+
+  // --- Round 2: images only (translations handled by v2 RPC) ---
+  const shipIdArr = [...shipIds], cabinIdArr = [...cabinIds], cpIdArr = [...cpIds]
+
+  const shipPhotoPromise = shipIdArr.length > 0
+    ? db.from("cruise_media").select("entity_id, r2_key")
+        .eq("entity_type", "ship").in("role", ["cover", "default"])
+        .in("entity_id", shipIdArr).not("r2_key", "is", null)
+        .order("role").order("sort_order")
     : Promise.resolve({ data: null })
 
-  const itinPromise = db.from("cruise_itineraries")
-    .select("cruise_id, day, order_id, port_name, canonical_port_id, arrive_time, depart_time")
-    .in("cruise_id", voyageIds)
-    .order("day", { ascending: true })
-    .order("order_id", { ascending: true })
-
-  // Ship + brand info
-  const shipsPromise = db.from("ships")
-    .select("id, name, tonnage, occupancy, total_cabins, launched, star_rating, ship_type")
-    .in("id", shipIds)
-  const brandsPromise = db.from("cruise_lines")
-    .select("id, name, logo")
-    .in("id", lineIds)
-
-  // Ship photos from cruise_media (fallback when RPC ship_image is null)
-  const shipPhotoPromise = db.from("cruise_media")
-    .select("entity_id, r2_key")
-    .eq("entity_type", "ship")
-    .in("entity_id", shipIds)
-    .not("r2_key", "is", null)
-    .in("role", ["cover", "default"])
-    .order("role", { ascending: true })
-    .order("sort_order", { ascending: true })
-
-  // Ship video URLs from cruise_media
-  const shipVideoPromise = db.from("cruise_media")
-    .select("entity_id, source_url")
-    .eq("entity_type", "ship")
-    .eq("role", "video")
-    .in("entity_id", shipIds)
-    .not("source_url", "is", null)
-    .limit(50)
-
-  // Cabin types per ship (one representative per cabin_type per ship)
-  const cabinTypesPromise = db.from("cabin_types")
-    .select("id, ship_id, cabin_name, cabin_type, accommodation_class, cabin_size_min, cabin_size_max, max_occupancy, accessible, description, facilities")
-    .in("ship_id", shipIds)
-    .order("ship_id")
-    .order("accommodation_class")
-    .order("cabin_name")
-    .limit(300)
-
-  // Cabin prices per voyage (cheapest per cabin_type)
-  const cabinPricesPromise = db.from("cruise_prices")
-    .select("cruise_id, cabin_type, price")
-    .in("cruise_id", voyageIds)
-    .not("price", "is", null)
-    .gt("price", 0)
-    .order("price", { ascending: true })
-    .limit(500)
-
-  // Ship/brand name translations
-  const shipNameTransPromise = locale
-    ? db.from("translations").select("record_id, value")
-        .eq("table_name", "ships").eq("locale", locale).eq("field_name", "name")
-        .in("record_id", shipIds)
-    : Promise.resolve({ data: null })
-  const brandNameTransPromise = locale
-    ? db.from("translations").select("record_id, value")
-        .eq("table_name", "cruise_lines").eq("locale", locale).eq("field_name", "name")
-        .in("record_id", lineIds)
+  const cabinImagePromise = cabinIdArr.length > 0
+    ? db.from("cruise_media").select("entity_id, r2_key")
+        .eq("entity_type", "cabin_type").in("role", ["default", "cover", "gallery"])
+        .in("entity_id", cabinIdArr).not("r2_key", "is", null)
+        .order("role").order("sort_order").limit(200)
     : Promise.resolve({ data: null })
 
-  const [nameTransResult, itinResult, shipsResult, brandsResult, shipPhotoResult, shipVideoResult, cabinTypesResult, cabinPricesResult, shipNameTransResult, brandNameTransResult] =
-    await Promise.all([nameTransPromise, itinPromise, shipsPromise, brandsPromise, shipPhotoPromise, shipVideoPromise, cabinTypesPromise, cabinPricesPromise, shipNameTransPromise, brandNameTransPromise])
+  const portPhotoPromise = cpIdArr.length > 0
+    ? db.from("cruise_media").select("entity_id, r2_key")
+        .eq("entity_type", "canonical_port").in("entity_id", cpIdArr)
+        .not("r2_key", "is", null).order("role").order("sort_order")
+    : Promise.resolve({ data: null })
 
-  const nameMap: Record<string, string> = {}
-  if (nameTransResult.data) for (const t of nameTransResult.data) nameMap[t.record_id] = t.value
+  const [shipPhotoResult, cabinImageResult, portPhotoResult] = await Promise.all([
+    shipPhotoPromise, cabinImagePromise, portPhotoPromise,
+  ])
 
-  // Ship photo map (first photo per ship, prefer cover > default)
+  // Build image lookup maps
   const shipPhotoMap: Record<string, string> = {}
-  if (shipPhotoResult.data) {
-    for (const m of shipPhotoResult.data) {
-      if (!shipPhotoMap[m.entity_id]) shipPhotoMap[m.entity_id] = m.r2_key
-    }
-  }
+  if (shipPhotoResult.data) for (const m of shipPhotoResult.data) shipPhotoMap[m.entity_id] ??= `${R2}/${m.r2_key}`
+  const cabinImageMap: Record<string, string> = {}
+  if (cabinImageResult.data) for (const m of cabinImageResult.data) cabinImageMap[m.entity_id] ??= `${R2}/${(m.r2_key as string).replace("/lg/", "/sm/")}`
+  const portPhotoMap: Record<string, string> = {}
+  if (portPhotoResult.data) for (const m of portPhotoResult.data) portPhotoMap[m.entity_id] ??= `${R2}/${(m.r2_key as string).replace("/lg/", "/sm/")}`
 
-  // Ship video map (first video per ship)
-  const shipVideoMap: Record<string, string> = {}
-  if (shipVideoResult.data) {
-    for (const m of shipVideoResult.data) {
-      if (!shipVideoMap[m.entity_id]) shipVideoMap[m.entity_id] = m.source_url
-    }
-  }
-
-  // Ship info map
-  type ShipRow = { id: string; name: string; tonnage: number | null; occupancy: number | null; total_cabins: number | null; launched: string | null; star_rating: number | null; ship_type: string | null }
-  const shipMap: Record<string, ShipRow> = {}
-  if (shipsResult.data) for (const s of shipsResult.data as ShipRow[]) shipMap[s.id] = s
-
-  // Brand info map
-  type BrandRow = { id: string; name: string; logo: string | null }
-  const brandMap: Record<string, BrandRow> = {}
-  if (brandsResult.data) for (const b of brandsResult.data as BrandRow[]) brandMap[b.id] = b
-
-  // Ship/brand name translation maps
-  const shipNameMap: Record<string, string> = {}
-  if (shipNameTransResult.data) for (const t of shipNameTransResult.data) shipNameMap[t.record_id] = t.value
-  const brandNameMap: Record<string, string> = {}
-  if (brandNameTransResult.data) for (const t of brandNameTransResult.data) brandNameMap[t.record_id] = t.value
-
-  // --- Cabin data processing ---
-  // Pick one representative cabin per (ship_id, accommodation_class)
-  type CabinRow = { id: string; ship_id: string; cabin_name: string; cabin_type: string | null; accommodation_class: string | null; cabin_size_min: number | null; cabin_size_max: number | null; max_occupancy: number | null; accessible: boolean; description: string | null; facilities: string[] | null }
-  const cabinsByShip: Record<string, CabinRow[]> = {}
-  const cabinIdSet = new Set<string>()
-  if (cabinTypesResult.data) {
-    const seen = new Set<string>()
-    for (const c of cabinTypesResult.data as CabinRow[]) {
-      const cls = c.accommodation_class || c.cabin_type || "Inside"
-      const key = `${c.ship_id}_${cls}`
-      if (seen.has(key)) continue
-      seen.add(key)
-      ;(cabinsByShip[c.ship_id] ??= []).push(c)
-      cabinIdSet.add(c.id)
-    }
-  }
-
-  // Cheapest price per (cruise_id, cabin_type)
-  type PriceRow = { cruise_id: string; cabin_type: string; price: number }
-  const cheapestByVoyageType: Record<string, Record<string, number>> = {}
-  if (cabinPricesResult.data) {
-    for (const p of cabinPricesResult.data as PriceRow[]) {
-      const ct = (p.cabin_type || "").toLowerCase()
-      const cls = ct.includes("suite") ? "Suite" : ct.includes("balcon") ? "Balcony" : ct.includes("outside") || ct.includes("ocean") ? "Outside" : "Inside"
-      if (!cheapestByVoyageType[p.cruise_id]) cheapestByVoyageType[p.cruise_id] = {}
-      if (!cheapestByVoyageType[p.cruise_id][cls] || p.price < cheapestByVoyageType[p.cruise_id][cls]) {
-        cheapestByVoyageType[p.cruise_id][cls] = p.price
-      }
-    }
-  }
-
-  // Second batch: cabin images + cabin name/description translations
-  const cabinIds = [...cabinIdSet]
-  let cabinImageMap: Record<string, string> = {}
-  let cabinNameTransMap: Record<string, string> = {}
-  let cabinDescTransMap: Record<string, string> = {}
-
-  if (cabinIds.length > 0) {
-    const cabinImagePromise = db.from("cruise_media")
-      .select("entity_id, r2_key")
-      .eq("entity_type", "cabin_type")
-      .in("entity_id", cabinIds)
-      .not("r2_key", "is", null)
-      .in("role", ["default", "cover", "gallery"])
-      .order("role")
-      .order("sort_order")
-      .limit(100)
-
-    const cabinNameTransPromise = locale
-      ? db.from("translations").select("record_id, value")
-          .eq("table_name", "cabin_types").eq("locale", locale).eq("field_name", "cabin_name")
-          .in("record_id", cabinIds)
-      : Promise.resolve({ data: null })
-
-    const cabinDescTransPromise = locale
-      ? db.from("translations").select("record_id, value")
-          .eq("table_name", "cabin_types").eq("locale", locale).eq("field_name", "description")
-          .in("record_id", cabinIds)
-      : Promise.resolve({ data: null })
-
-    const [cabinImageResult, cabinNameTransResult, cabinDescTransResult] = await Promise.all([cabinImagePromise, cabinNameTransPromise, cabinDescTransPromise])
-
-    if (cabinImageResult.data) {
-      for (const m of cabinImageResult.data) {
-        if (!cabinImageMap[m.entity_id]) cabinImageMap[m.entity_id] = m.r2_key
-      }
-    }
-    if (cabinNameTransResult.data) {
-      for (const t of cabinNameTransResult.data) cabinNameTransMap[t.record_id] = t.value
-    }
-    if (cabinDescTransResult.data) {
-      for (const t of cabinDescTransResult.data) cabinDescTransMap[t.record_id] = t.value
-    }
-  }
-
-  // Group itineraries by cruise_id
-  type ItinRow = { cruise_id: string; day: number; order_id: number; port_name: string; canonical_port_id: string | null; arrive_time: string | null; depart_time: string | null }
-  const itinByCruise: Record<string, ItinRow[]> = {}
-  const allCanonicalIds = new Set<string>()
-  if (itinResult.data) {
-    for (const row of itinResult.data as ItinRow[]) {
-      ;(itinByCruise[row.cruise_id] ??= []).push(row)
-      if (row.canonical_port_id) allCanonicalIds.add(row.canonical_port_id)
-    }
-  }
-
-  // --- Fetch port photos + descriptions for all canonical ports ---
-  const canonicalIds = [...allCanonicalIds]
-  let portPhotoMap: Record<string, string> = {}
-  let portDescMap: Record<string, string> = {}
-  let portNameTransMap: Record<string, string> = {}
-  let portNameFallback: Record<string, string> = {}
-
-  if (canonicalIds.length > 0) {
-    const photoPromise = db.from("cruise_media")
-      .select("entity_id, r2_key")
-      .eq("entity_type", "canonical_port")
-      .in("entity_id", canonicalIds)
-      .not("r2_key", "is", null)
-      .order("role", { ascending: true })
-      .order("sort_order", { ascending: true })
-
-    const descPromise = db.from("canonical_ports")
-      .select("id, name, article_summary")
-      .in("id", canonicalIds)
-
-    // Port name + description translations
-    const portNameTransPromise = locale
-      ? db.from("translations").select("record_id, value")
-          .eq("table_name", "canonical_ports").eq("locale", locale).eq("field_name", "name")
-          .in("record_id", canonicalIds)
-      : Promise.resolve({ data: null })
-
-    const portDescTransPromise = locale
-      ? db.from("translations").select("record_id, value")
-          .eq("table_name", "canonical_ports").eq("locale", locale).eq("field_name", "article_summary")
-          .in("record_id", canonicalIds)
-      : Promise.resolve({ data: null })
-
-    const [photoResult, descResult, portNameTransResult, portDescTransResult] = await Promise.all([
-      photoPromise, descPromise, portNameTransPromise, portDescTransPromise,
-    ])
-
-    if (photoResult.data) {
-      // Keep only first photo per port
-      for (const p of photoResult.data) {
-        if (!portPhotoMap[p.entity_id]) portPhotoMap[p.entity_id] = `${R2}/${p.r2_key.replace("/lg/", "/sm/")}`
-      }
-    }
-    // English fallback port names + descriptions from canonical_ports
-    const descFallback: Record<string, string> = {}
-    if (descResult.data) {
-      for (const d of descResult.data) {
-        if (d.name) portNameFallback[d.id] = d.name
-        if (d.article_summary) descFallback[d.id] = d.article_summary
-      }
-    }
-    // Translated descriptions override English
-    const descTransMap: Record<string, string> = {}
-    if (portDescTransResult.data) {
-      for (const t of portDescTransResult.data) descTransMap[t.record_id] = t.value
-    }
-    // Merge: translated > English fallback
-    for (const id of canonicalIds) {
-      const desc = descTransMap[id] ?? descFallback[id]
-      if (desc) portDescMap[id] = desc
-    }
-
-    if (portNameTransResult.data) {
-      for (const t of portNameTransResult.data) portNameTransMap[t.record_id] = t.value
-    }
-  }
-
+  // --- Assemble response ---
   return {
     total: voyages[0]?.total_count ?? 0,
     locale: locale ?? "en",
     voyages: voyages.map((v: Record<string, unknown>) => {
-      const lineSlug = (v.line_nice_url as string) ?? ""
-      const shipNiceUrl = (v.ship_nice_url as string) ?? ""
-      const shipSlug = shipNiceUrl.includes("/") ? shipNiceUrl.split("/").pop() : shipNiceUrl
-      const slug = `${lineSlug}-${shipSlug}-${v.sail_date}-${v.nights}n`
       const cruiseId = v.id as string
+      const detail = detailMap[cruiseId]
+      const lineSlug = (v.line_nice_url as string) ?? ""
+      const sailMonth = (v.sail_date as string).slice(0, 7)
+      const base = `https://siloah.travel${locale ? `/${locale}` : ""}/cruise/voyages`
+      const voyageLink = `${base}?line=${lineSlug}&month=${sailMonth}`
 
-      // Build itinerary array
-      const rawItin = itinByCruise[cruiseId] ?? []
-      const itinerary = rawItin.map((it) => {
-        const cpId = it.canonical_port_id
-        // Name priority: translated > port_name > canonical_ports.name
-        const resolvedName = (cpId && portNameTransMap[cpId])
-          ? portNameTransMap[cpId]
-          : it.port_name || (cpId && portNameFallback[cpId]) || null
-        const nameLC = (it.port_name || "").toLowerCase()
-        const isSeaDay = !resolvedName || nameLC.includes("at sea") || nameLC.includes("sea day")
+      // If detail RPC failed, return basic card data only
+      if (!detail) {
         return {
-          day: it.day,
-          portName: resolvedName ?? "",
+          name: v.name,
+          shipName: "", sailDate: v.sail_date, nights: v.nights,
+          departurePort: v.start_port_name, arrivalPort: v.end_port_name,
+          price: v.cheapest_price, destinations: v.destinations,
+          image: v.cover_image ? `${R2}/${v.cover_image}` : null,
+          shipImage: v.ship_image ? `${R2}/${v.ship_image}` : null,
+          link: voyageLink,
+          itinerary: [], brand: null, ship: null, cabins: [],
+        }
+      }
+
+      const cruise = detail.cruise as Record<string, unknown>
+      const ship = detail.ship as Record<string, unknown> | null
+      const brand = detail.brand as Record<string, unknown> | null
+      const sId = (ship?.id as string) ?? ""
+
+      // Itinerary from v2 RPC (translations built-in)
+      const rawItin = (detail.itinerary ?? []) as Array<Record<string, unknown>>
+      const itinerary = rawItin.map((it) => {
+        const cpId = it.cp_id as string | null
+        const portName = (it.cp_name as string) || (it.port_name as string) || ""
+        const nameLC = ((it.port_name as string) || "").toLowerCase()
+        const isSeaDay = !portName || nameLC.includes("at sea") || nameLC.includes("sea day")
+        const desc = (it.article_summary as string) ?? (it.cp_description as string) ?? null
+        return {
+          day: it.day as number,
+          portName,
           arriveTime: it.arrive_time ? String(it.arrive_time).slice(0, 5) : null,
           departTime: it.depart_time ? String(it.depart_time).slice(0, 5) : null,
           image: cpId ? (portPhotoMap[cpId] ?? null) : null,
-          description: cpId ? (portDescMap[cpId] ?? null) : null,
+          description: desc,
           isSeaDay,
         }
       })
 
-      // Ship & brand info
-      const sId = v.ship_id as string
-      const lId = v.line_id as string
-      const ship = shipMap[sId]
-      const brand = brandMap[lId]
+      // Cabins from v2 RPC (translations built-in) + prices
+      const rpcCabins = (detail.cabins ?? []) as Array<Record<string, unknown>>
+      const rpcPrices = (detail.prices ?? []) as Array<Record<string, unknown>>
+      const priceByExtId: Record<string, number> = {}
+      for (const p of rpcPrices) {
+        const eid = p.cabin_type_id as string
+        const price = p.price as number
+        if (eid && price > 0 && (!priceByExtId[eid] || price < priceByExtId[eid])) {
+          priceByExtId[eid] = price
+        }
+      }
+
+      const cabins = rpcCabins.map((c) => {
+        const cId = c.id as string
+        const cls = (c.accommodation_class as string) || (c.cabin_type as string) || "Inside"
+        const rawDesc = (c.description as string) ?? ""
+        const plainDesc = rawDesc.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").trim()
+        return {
+          name: c.cabin_name as string,
+          type: normalizeCls(cls),
+          description: plainDesc.length > 300 ? plainDesc.slice(0, 300) + "…" : plainDesc || null,
+          sizeMin: c.cabin_size_min as number | null,
+          sizeMax: c.cabin_size_max as number | null,
+          maxOccupancy: c.max_occupancy as number | null,
+          accessible: c.accessible as boolean,
+          facilities: ((c.facilities as string[]) ?? []).slice(0, 6),
+          image: cabinImageMap[cId] ?? null,
+          price: priceByExtId[c.external_id as string] ?? null,
+        }
+      }).sort((a, b) => CLASS_ORDER.indexOf(a.type) - CLASS_ORDER.indexOf(b.type))
+
+      const brandLogo = brand?.logo
+        ? ((brand.logo as string).startsWith("http") ? brand.logo as string : `${R2}/${brand.logo}`)
+        : null
 
       return {
-        name: nameMap[cruiseId] ?? v.name,
-        shipName: shipNameMap[sId] ?? ship?.name ?? (shipNiceUrl ? String(shipSlug).replace(/-/g, " ") : ""),
+        name: cruise.name ?? v.name,
+        shipName: (ship?.name as string) ?? "",
         sailDate: v.sail_date,
         nights: v.nights,
         departurePort: v.start_port_name,
@@ -392,76 +246,106 @@ async function searchVoyages(env: Env, params: {
         price: v.cheapest_price,
         destinations: v.destinations,
         image: v.cover_image ? `${R2}/${v.cover_image}` : null,
-        shipImage: v.ship_image ? `${R2}/${v.ship_image}` : (shipPhotoMap[sId] ? `${R2}/${shipPhotoMap[sId].replace("/lg/", "/sm/")}` : null),
-        link: `https://siloah.travel${locale ? `/${locale}` : ""}/cruise/voyages/${slug}`,
+        shipImage: v.ship_image ? `${R2}/${v.ship_image}` : (shipPhotoMap[sId] ? shipPhotoMap[sId].replace("/lg/", "/sm/") : null),
+        link: voyageLink,
         itinerary,
-        // Ship & brand details
         brand: brand ? {
-          name: brandNameMap[lId] ?? brand.name,
-          logo: brand.logo ? (brand.logo.startsWith("http") ? brand.logo : `${R2}/${brand.logo}`) : null,
+          name: brand.name as string,
+          logo: brandLogo,
         } : null,
         ship: ship ? {
-          name: shipNameMap[sId] ?? ship.name,
-          tonnage: ship.tonnage,
-          passengers: ship.occupancy,
-          cabins: ship.total_cabins,
+          name: ship.name as string,
+          tonnage: ship.tonnage as number | null,
+          passengers: ship.occupancy as number | null,
+          cabins: ship.total_cabins as number | null,
           launched: ship.launched ? String(ship.launched).slice(0, 4) : null,
-          starRating: ship.star_rating,
-          type: ship.ship_type,
-          videoUrl: shipVideoMap[sId] ?? null,
+          starRating: ship.star_rating as number | null,
+          type: ship.ship_type as string | null,
+          videoUrl: (ship.video_url as string) ?? null,
         } : null,
-        // Cabin types with prices
-        cabins: (() => {
-          const shipCabins = cabinsByShip[sId] ?? []
-          const voyagePrices = cheapestByVoyageType[cruiseId] ?? {}
-          const CLASS_ORDER = ["Suite", "Balcony", "Outside", "Inside"]
-          return shipCabins
-            .map((c) => {
-              const cls = c.accommodation_class || c.cabin_type || "Inside"
-              const normalizedCls = cls.includes("Suite") ? "Suite" : cls.includes("Balcon") ? "Balcony" : cls.includes("Outside") || cls.includes("Ocean") ? "Outside" : "Inside"
-              // Strip HTML tags from description for plain text display
-              const rawDesc = cabinDescTransMap[c.id] ?? c.description ?? ""
-              const plainDesc = rawDesc.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").trim()
-              return {
-                name: cabinNameTransMap[c.id] ?? c.cabin_name,
-                type: normalizedCls,
-                description: plainDesc.length > 300 ? plainDesc.slice(0, 300) + "…" : plainDesc || null,
-                sizeMin: c.cabin_size_min,
-                sizeMax: c.cabin_size_max,
-                maxOccupancy: c.max_occupancy,
-                accessible: c.accessible,
-                facilities: c.facilities?.slice(0, 6) ?? [],
-                image: cabinImageMap[c.id] ? `${R2}/${cabinImageMap[c.id].replace("/lg/", "/sm/")}` : null,
-                price: voyagePrices[normalizedCls] ?? null,
-              }
-            })
-            .sort((a, b) => CLASS_ORDER.indexOf(a.type) - CLASS_ORDER.indexOf(b.type))
-        })(),
+        cabins,
       }
     }),
   }
 }
 
-async function searchBrands(env: Env, params: { name?: string; tier?: string }) {
+async function searchBrands(env: Env, params: { name?: string; tier?: string; locale?: string }) {
   const db = getDb(env)
-  let query = db.from("cruise_lines")
-    .select("name, nice_url, description, tier, ship_count, cruise_count, currency, logo")
-    .eq("is_enabled", true)
-    .order("sort_order", { ascending: true })
-  if (params.name) query = query.or(`name.ilike.%${params.name}%,nice_url.ilike.%${params.name.toLowerCase().replace(/\s+/g, "-")}%`)
-  if (params.tier) query = query.eq("tier", params.tier)
-  const { data, error } = await query.limit(10)
+  const locale = normalizeLocale(params.locale)
+  const R2 = "https://media.siloah.travel"
+
+  // Use get_brand_list RPC — returns all enabled brands with translations
+  const { data: allBrands, error } = await db.rpc("get_brand_list", { p_locale: locale ?? "en" })
   if (error) return { error: error.message }
+
+  // Client-side filtering (RPC returns all brands)
+  let brands = (allBrands ?? []) as Array<Record<string, unknown>>
+  if (params.tier) brands = brands.filter((b) => b.tier === params.tier)
+  if (params.name) {
+    const q = params.name.toLowerCase()
+    brands = brands.filter((b) =>
+      ((b.name as string) ?? "").toLowerCase().includes(q) ||
+      ((b.name_en as string) ?? "").toLowerCase().includes(q) ||
+      ((b.nice_url as string) ?? "").includes(q.replace(/\s+/g, "-"))
+    )
+  }
+  brands = brands.slice(0, 10)
+
+  const lineIds = brands.map((b) => b.id as string)
+
+  // Fetch ships for these brands + ship images
+  let shipsByLine: Record<string, Array<{ id: string; name: string; nice_url: string; ship_type: string | null; occupancy: number | null; star_rating: number | null }>> = {}
+  let shipImageMap: Record<string, string> = {}
+
+  if (lineIds.length > 0) {
+    const { data: shipsData } = await db.from("ships")
+      .select("id, name, nice_url, line_id, ship_type, occupancy, star_rating")
+      .eq("is_enabled", true)
+      .in("line_id", lineIds)
+      .order("line_id").order("name", { ascending: true })
+      .limit(500)
+
+    if (shipsData) {
+      const shipIds = shipsData.map((s: { id: string }) => s.id)
+      for (const s of shipsData as Array<{ id: string; name: string; nice_url: string; line_id: string; ship_type: string | null; occupancy: number | null; star_rating: number | null }>) {
+        ;(shipsByLine[s.line_id] ??= []).push(s)
+      }
+
+      if (shipIds.length > 0) {
+        const { data: media } = await db.from("cruise_media")
+          .select("entity_id, r2_key")
+          .eq("entity_type", "ship")
+          .in("role", ["cover", "default"])
+          .in("entity_id", shipIds).not("r2_key", "is", null)
+          .order("role", { ascending: true })
+          .order("sort_order", { ascending: true })
+        if (media) for (const m of media) shipImageMap[m.entity_id] ??= `${R2}/${m.r2_key}`
+      }
+    }
+  }
+
   return {
-    brands: (data ?? []).map((b) => ({
-      name: b.name,
-      tier: b.tier,
-      description: b.description?.slice(0, 200) ?? "",
-      shipCount: b.ship_count,
-      cruiseCount: b.cruise_count,
-      logo: b.logo ? (b.logo.startsWith("http") ? b.logo : `https://media.siloah.travel/${b.logo}`) : null,
-      link: `https://siloah.travel/cruise/${b.nice_url}`,
-    })),
+    locale: locale ?? "en",
+    brands: brands.map((b) => {
+      const desc = (b.description as string) ?? (b.description_en as string) ?? ""
+      return {
+        name: b.name as string,
+        tier: b.tier as string,
+        description: desc.length > 300 ? desc.slice(0, 300) + "…" : desc,
+        shipCount: b.ship_count as number,
+        cruiseCount: b.cruise_count as number,
+        logo: b.logo ? ((b.logo as string).startsWith("http") ? b.logo as string : `${R2}/${b.logo}`) : null,
+        link: `https://siloah.travel${locale ? `/${locale}` : ""}/cruise/${b.nice_url}`,
+        ships: (shipsByLine[b.id as string] ?? []).map((s) => ({
+          name: s.name,
+          type: s.ship_type,
+          passengers: s.occupancy,
+          starRating: s.star_rating,
+          image: shipImageMap[s.id] ?? null,
+          link: `https://siloah.travel${locale ? `/${locale}` : ""}/cruise/${s.nice_url}`,
+        })),
+      }
+    }),
   }
 }
 
@@ -472,9 +356,11 @@ async function searchShips(env: Env, params: {
   const db = getDb(env)
   const locale = normalizeLocale(params.locale)
 
+  // Initial filtered search (no get_ship_list RPC yet)
   let query = db.from("ships")
-    .select("id, name, nice_url, line_name, tonnage, occupancy, total_cabins, launched, ship_type, star_rating, cruise_count")
+    .select("id, name, nice_url, line_id, line_name, tonnage, occupancy, total_cabins, launched, ship_type, star_rating, cruise_count, cruise_lines!line_id!inner(is_enabled)")
     .eq("is_enabled", true)
+    .eq("cruise_lines.is_enabled", true)
     .order("name", { ascending: true })
   if (params.name) query = query.ilike("name", `%${params.name}%`)
   if (params.brandName) query = query.ilike("line_name", `%${params.brandName}%`)
@@ -483,53 +369,69 @@ async function searchShips(env: Env, params: {
   if (params.maxPassengers) query = query.lte("occupancy", params.maxPassengers)
   const { data, error } = await query.limit(10)
   if (error) return { error: error.message }
+  if (!data || data.length === 0) return { locale: locale ?? "en", ships: [] }
 
-  // Fetch hero images + translations in parallel
   const R2 = "https://media.siloah.travel"
-  const shipIds = (data ?? []).map((s) => s.id)
-  let imageMap: Record<string, string> = {}
-  let transMap: Record<string, Record<string, string>> = {}
 
-  if (shipIds.length > 0) {
-    const imagePromise = db.from("cruise_media")
-      .select("entity_id, r2_key")
-      .eq("entity_type", "ship").eq("role", "hero")
-      .in("entity_id", shipIds).not("r2_key", "is", null)
-      .then(({ data: media }) => {
-        if (media) for (const m of media) imageMap[m.entity_id] = `${R2}/${m.r2_key}`
-      })
-
-    const transPromise = locale
-      ? db.from("translations")
-          .select("record_id, field_name, value")
-          .eq("table_name", "ships").eq("locale", locale)
-          .in("record_id", shipIds)
-          .then(({ data: trans }) => {
-            if (trans) for (const t of trans) {
-              transMap[t.record_id] ??= {}
-              transMap[t.record_id][t.field_name] = t.value
-            }
-          })
-      : Promise.resolve()
-
-    await Promise.all([imagePromise, transPromise])
+  // Fetch full detail for each ship via get_ship_detail RPC (replaces 9+ queries)
+  const detailResults = await Promise.all(
+    data.map((s) => db.rpc("get_ship_detail", { p_ship_id: s.id, p_locale: locale ?? "en" }))
+  )
+  const detailMap: Record<string, Record<string, unknown>> = {}
+  for (let i = 0; i < data.length; i++) {
+    if (detailResults[i].data) detailMap[data[i].id] = detailResults[i].data as Record<string, unknown>
   }
 
   return {
     locale: locale ?? "en",
-    ships: (data ?? []).map((s) => ({
-      name: transMap[s.id]?.name ?? s.name,
-      brand: s.line_name,
-      tonnage: s.tonnage,
-      passengers: s.occupancy,
-      cabins: s.total_cabins,
-      launched: s.launched?.slice(0, 4) ?? null,
-      type: s.ship_type,
-      starRating: s.star_rating,
-      cruiseCount: s.cruise_count,
-      image: imageMap[s.id] ?? null,
-      link: `https://siloah.travel/cruise/${s.nice_url}`,
-    })),
+    ships: data.map((s) => {
+      const detail = detailMap[s.id]
+      const ship = detail?.ship as Record<string, unknown> | undefined
+      const brand = detail?.brand as Record<string, unknown> | undefined
+      const cabins = (detail?.cabins ?? []) as Array<Record<string, unknown>>
+
+      const brandLogo = brand?.logo
+        ? ((brand.logo as string).startsWith("http") ? brand.logo as string : `${R2}/${brand.logo}`)
+        : null
+      const heroImage = ship?.hero_image
+        ? `${R2}/${ship.hero_image}`
+        : null
+      const videoUrls = (ship?.video_urls ?? []) as string[]
+
+      return {
+        name: (ship?.name as string) ?? s.name,
+        brand: (brand?.name as string) ?? s.line_name,
+        brandLogo,
+        tonnage: s.tonnage,
+        passengers: s.occupancy,
+        cabins: s.total_cabins,
+        launched: s.launched?.slice(0, 4) ?? null,
+        type: s.ship_type,
+        starRating: s.star_rating,
+        cruiseCount: s.cruise_count,
+        image: heroImage,
+        videoUrl: videoUrls[0] ?? null,
+        link: `https://siloah.travel${locale ? `/${locale}` : ""}/cruise/${s.nice_url}`,
+        cabinTypes: cabins.map((c) => {
+          const cls = (c.accommodation_class as string) || (c.cabin_type as string) || "Inside"
+          const rawDesc = (c.description as string) ?? ""
+          const plainDesc = rawDesc.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").trim()
+          const images = (c.images ?? []) as string[]
+          const firstImage = images[0] ? `${R2}/${(images[0] as string).replace("/lg/", "/sm/")}` : null
+          return {
+            name: (c.cabin_name as string),
+            type: normalizeCls(cls),
+            description: plainDesc.length > 300 ? plainDesc.slice(0, 300) + "…" : plainDesc || null,
+            sizeMin: c.cabin_size_min as number | null,
+            sizeMax: c.cabin_size_max as number | null,
+            maxOccupancy: c.max_occupancy as number | null,
+            accessible: c.accessible as boolean,
+            facilities: ((c.facilities as string[]) ?? []).slice(0, 6),
+            image: firstImage,
+          }
+        }).sort((a, b) => CLASS_ORDER.indexOf(a.type) - CLASS_ORDER.indexOf(b.type)),
+      }
+    }),
   }
 }
 
@@ -571,6 +473,7 @@ async function searchByContent(env: Env, params: { query: string; source?: strin
 
 const VOYAGES_WIDGET_URI = "ui://siloah/voyages.html"
 const SHIPS_WIDGET_URI = "ui://siloah/ships.html"
+const BRANDS_WIDGET_URI = "ui://siloah/brands.html"
 
 // --- Create MCP server with tools ---
 
@@ -599,9 +502,32 @@ function createMcpServer(env: Env) {
         text: VOYAGES_WIDGET_HTML,
         _meta: {
           ui: {
-            prefersBorder: true,
+            prefersBorder: false,
             csp: {
               resourceDomains: ["https://media.siloah.travel", "https://i.ytimg.com", "https://www.youtube.com"],
+            },
+          },
+        },
+      }],
+    })
+  )
+
+  // --- Register UI resource for brand cards ---
+  registerAppResource(
+    server,
+    "Brand Cards",
+    BRANDS_WIDGET_URI,
+    { description: "Interactive cruise line search results displayed as rich cards" },
+    async () => ({
+      contents: [{
+        uri: BRANDS_WIDGET_URI,
+        mimeType: RESOURCE_MIME_TYPE,
+        text: BRANDS_WIDGET_HTML,
+        _meta: {
+          ui: {
+            prefersBorder: false,
+            csp: {
+              resourceDomains: ["https://media.siloah.travel"],
             },
           },
         },
@@ -622,7 +548,7 @@ function createMcpServer(env: Env) {
         text: SHIPS_WIDGET_HTML,
         _meta: {
           ui: {
-            prefersBorder: true,
+            prefersBorder: false,
             csp: {
               resourceDomains: ["https://media.siloah.travel", "https://i.ytimg.com", "https://www.youtube.com"],
             },
@@ -638,15 +564,15 @@ function createMcpServer(env: Env) {
     "searchVoyages",
     {
       title: "Search Voyages",
-      description: `Search cruise voyages with multilingual support (30 languages). To find voyages visiting a specific country (e.g. Japan, Greece, Italy), use viaCountryCode with the ISO 3166-1 alpha-2 code (e.g. 'JP', 'GR', 'IT'). To find voyages visiting a specific city/port (e.g. Santorini, Tokyo), use viaCity. The 'destination' field is ONLY for broad ocean regions. IMPORTANT: Always pass the 'locale' parameter matching the user's language to get localized results (voyage names, port names, destinations in user's language).`,
+      description: `Search cruise voyages with multilingual support (30 languages). To find voyages visiting a place, ALWAYS use viaCountryCode (ISO 3166-1 alpha-2) instead of viaCity — it is much faster. Map cities to their country: 'Bali' → 'ID', 'Santorini' → 'GR', 'Tokyo' → 'JP', 'Barcelona' → 'ES', 'Dubrovnik' → 'HR'. The 'destination' field is ONLY for broad ocean regions (Mediterranean, Caribbean, etc.). IMPORTANT: Always pass the 'locale' parameter matching the user's language. Each result includes a 'link' field — ALWAYS use these links verbatim when presenting results. NEVER construct or modify URLs yourself.`,
       inputSchema: {
         destination: z.string().optional().describe("Broad ocean region ONLY. One of: Mediterranean, Caribbean, Alaska, Antarctica, Europe, Asia, Oceania, NorthAmerica, SouthAmerica, Africa, Transatlantic, Baltic, NorthernEurope. Do NOT put country names here."),
         departureCountryCode: z.string().optional().describe("ISO 3166-1 alpha-2 code of departure country, e.g. 'US', 'GB', 'AU', 'JP'"),
         departureCity: z.string().optional().describe("Departure port city in English, e.g. 'Auckland', 'Miami', 'Southampton'"),
         arrivalCountryCode: z.string().optional().describe("ISO 3166-1 alpha-2 code of arrival country"),
         arrivalCity: z.string().optional().describe("Arrival port city in English, e.g. 'Sydney', 'Venice'"),
-        viaCountryCode: z.string().optional().describe("ISO 3166-1 alpha-2 code of a country the voyage visits/passes through. Use this when user asks for voyages 'in Japan' (JP), 'to Greece' (GR), 'visiting Italy' (IT), etc."),
-        viaCity: z.string().optional().describe("A city or port the voyage visits, in English. Use this when user asks for a specific place like 'Santorini', 'Bali', 'Tokyo', 'Dubrovnik'."),
+        viaCountryCode: z.string().optional().describe("ISO 3166-1 alpha-2 code of a country the voyage visits/passes through. PREFERRED over viaCity — always use this when the place maps to a country. Examples: 'Bali' → 'ID', 'Santorini' → 'GR', 'Tokyo' → 'JP', 'Dubrovnik' → 'HR', 'Barcelona' → 'ES', 'Alaska' → 'US'. Use viaCity ONLY for very specific small ports that need exact name matching."),
+        viaCity: z.string().optional().describe("Exact port/city name in English. SLOW — prefer viaCountryCode instead. Only use this as a last resort for very specific small ports where country code alone is too broad."),
         brandName: z.string().optional().describe("Cruise line/brand name, e.g. 'Silversea', 'MSC', 'Ponant', 'Viking'"),
         monthFrom: z.string().optional().describe("Start month in YYYY-MM format, e.g. '2027-07'. Use this when user says 'in July 2027' or 'next summer'."),
         minNights: z.number().optional().describe("Minimum number of nights"),
@@ -672,23 +598,31 @@ function createMcpServer(env: Env) {
     }
   )
 
-  // --- searchBrands (text-only, no widget yet) ---
+  // --- searchBrands (with widget UI) ---
   registerAppTool(
     server,
     "searchBrands",
     {
       title: "Search Brands",
-      description: "Search cruise brands/lines. Returns brand info with links to siloah.travel.",
+      description: "Search cruise brands/lines with multilingual support (30 languages). Returns brand info, fleet details, and links to siloah.travel. IMPORTANT: Always pass the 'locale' parameter matching the user's language. Each result includes a 'link' field — ALWAYS use these links verbatim. NEVER construct or modify URLs yourself.",
       inputSchema: {
         name: z.string().optional().describe("Brand name, e.g. 'Silversea', 'Ponant'"),
         tier: z.string().optional().describe("Tier: 'ultra_luxury', 'luxury', 'popular'"),
+        locale: z.string().optional().describe("Language code for localized results. ALWAYS pass this based on the user's language. Supported: en, zh-TW, zh-CN, ja, ko, ar, tr, he, fa, th, vi, ms, id, hi, ta, de, fr, es, it, pt, nl, no, ru, bn, ur, fil, sw, pl, uk, mn."),
       },
       annotations: readOnlyAnnotations,
-      _meta: {},
+      _meta: {
+        ui: { resourceUri: BRANDS_WIDGET_URI },
+        "openai/toolInvocation/invoking": "Searching cruise lines...",
+        "openai/toolInvocation/invoked": "Cruise lines found.",
+      },
     },
     async (params) => {
       const result = await searchBrands(env, params)
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] }
+      return {
+        structuredContent: result as Record<string, unknown>,
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      }
     }
   )
 
@@ -698,7 +632,7 @@ function createMcpServer(env: Env) {
     "searchShips",
     {
       title: "Search Ships",
-      description: "Search cruise ships by name, brand, type, or passenger capacity with multilingual support (30 languages). IMPORTANT: Always pass the 'locale' parameter matching the user's language.",
+      description: "Search cruise ships by name, brand, type, or passenger capacity with multilingual support (30 languages). IMPORTANT: Always pass the 'locale' parameter matching the user's language. Each result includes a 'link' field — ALWAYS use these links verbatim. NEVER construct or modify URLs yourself.",
       inputSchema: {
         name: z.string().optional().describe("Ship name, e.g. 'Silver Nova'"),
         brandName: z.string().optional().describe("Cruise line, e.g. 'Silversea'"),
@@ -752,7 +686,7 @@ const OPENAPI_SPEC = {
   openapi: "3.1.0",
   info: {
     title: "Siloah Travel — Luxury Cruise Search API",
-    description: "Search 26,000+ luxury cruise voyages, 200+ ships, and 20 premium cruise brands worldwide. All results include links to siloah.travel for full details and booking.",
+    description: "Search 26,000+ luxury cruise voyages, 200+ ships, and 20 premium cruise brands worldwide. All results include a 'link' field with a direct URL to siloah.travel. IMPORTANT: Always present these links verbatim to the user — never construct, modify, or guess URLs yourself.",
     version: "1.0.0",
   },
   servers: [{ url: "https://mcp.siloah.travel" }],
@@ -768,7 +702,7 @@ const OPENAPI_SPEC = {
           { name: "arrivalCountryCode", in: "query", schema: { type: "string" }, description: "Arrival country ISO code" },
           { name: "arrivalCity", in: "query", schema: { type: "string" }, description: "Arrival port city in English" },
           { name: "viaCountryCode", in: "query", schema: { type: "string" }, description: "Via country ISO code" },
-          { name: "viaCity", in: "query", schema: { type: "string" }, description: "Via city/place in English, e.g. 'Santorini', 'Bali'" },
+          { name: "viaCity", in: "query", schema: { type: "string" }, description: "Via city/place in English. Slow — prefer viaCountryCode instead" },
           { name: "brandName", in: "query", schema: { type: "string" }, description: "Cruise line name, e.g. 'Silversea', 'MSC'" },
           { name: "monthFrom", in: "query", schema: { type: "string" }, description: "Start month YYYY-MM" },
           { name: "minNights", in: "query", schema: { type: "integer" }, description: "Minimum nights" },
@@ -782,7 +716,7 @@ const OPENAPI_SPEC = {
             sailDate: { type: "string" }, nights: { type: "integer" },
             departurePort: { type: "string" }, arrivalPort: { type: "string" },
             price: { type: "number", nullable: true }, destinations: { type: "array", items: { type: "string" } },
-            image: { type: "string", nullable: true }, link: { type: "string" },
+            image: { type: "string", nullable: true }, link: { type: "string", description: "Direct URL to this voyage on siloah.travel. ALWAYS use verbatim — never construct your own URLs." },
           } } },
         } } } } } },
       },
@@ -799,7 +733,7 @@ const OPENAPI_SPEC = {
           brands: { type: "array", items: { type: "object", properties: {
             name: { type: "string" }, tier: { type: "string" }, description: { type: "string" },
             shipCount: { type: "integer" }, cruiseCount: { type: "integer" },
-            logo: { type: "string", nullable: true }, link: { type: "string" },
+            logo: { type: "string", nullable: true }, link: { type: "string", description: "Direct URL to this brand on siloah.travel. ALWAYS use verbatim — never construct your own URLs." },
           } } },
         } } } } } },
       },
@@ -821,7 +755,7 @@ const OPENAPI_SPEC = {
             passengers: { type: "integer", nullable: true }, cabins: { type: "integer", nullable: true },
             launched: { type: "string", nullable: true }, type: { type: "string", nullable: true },
             starRating: { type: "number", nullable: true }, cruiseCount: { type: "integer" },
-            image: { type: "string", nullable: true }, link: { type: "string" },
+            image: { type: "string", nullable: true }, link: { type: "string", description: "Direct URL to this ship on siloah.travel. ALWAYS use verbatim — never construct your own URLs." },
           } } },
         } } } } } },
       },
@@ -910,6 +844,7 @@ export default {
       return searchBrands(env, {
         name: p.get("name") || undefined,
         tier: p.get("tier") || undefined,
+        locale: p.get("locale") || undefined,
       }).then(jsonResponse)
     }
 

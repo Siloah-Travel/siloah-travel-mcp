@@ -1,10 +1,10 @@
 import { useState, useCallback, useEffect } from "react"
 import useEmblaCarousel from "embla-carousel-react"
-import { ChevronLeft, ChevronRight, Star, Anchor, Users, Ship as ShipIcon } from "lucide-react"
+import { ChevronLeft, ChevronRight, Ship, Anchor } from "lucide-react"
 import { t } from "./i18n"
-import type { Ship } from "./ships"
+import type { Brand } from "./brands"
 
-export function ShipCarousel({ ships, onSelectShip }: { ships: Ship[]; onSelectShip?: (index: number) => void }) {
+export function BrandCarousel({ brands, onSelectBrand }: { brands: Brand[]; onSelectBrand?: (index: number) => void }) {
   const [emblaRef, emblaApi] = useEmblaCarousel({
     align: "start",
     containScroll: "trimSnaps",
@@ -36,8 +36,8 @@ export function ShipCarousel({ ships, onSelectShip }: { ships: Ship[]; onSelectS
     <div style={{ position: "relative" }}>
       <div ref={emblaRef} style={{ overflow: "hidden" }}>
         <div style={{ display: "flex", gap: 12 }}>
-          {ships.map((s, i) => (
-            <ShipCard key={i} ship={s} onClick={onSelectShip ? () => onSelectShip(i) : undefined} />
+          {brands.map((b, i) => (
+            <BrandCard key={i} brand={b} onClick={onSelectBrand ? () => onSelectBrand(i) : undefined} />
           ))}
         </div>
       </div>
@@ -74,12 +74,15 @@ function NavButton({ dir, onClick }: { dir: "prev" | "next"; onClick: () => void
   )
 }
 
-function ShipCard({ ship: s, onClick }: { ship: Ship; onClick?: () => void }) {
-  const specs: string[] = []
-  if (s.passengers) specs.push(`${s.passengers.toLocaleString()} guests`)
-  if (s.cabins) specs.push(`${s.cabins.toLocaleString()} cabins`)
-  if (s.tonnage) specs.push(`${Number(s.tonnage).toLocaleString()} GT`)
-  if (s.launched) specs.push(`Built ${s.launched}`)
+function BrandCard({ brand: b, onClick }: { brand: Brand; onClick?: () => void }) {
+  const coverImage = b.ships?.find((s) => s.image)?.image ?? null
+  const tierKey = b.tier ? `tier_${b.tier}` : null
+  const tierColors: Record<string, { bg: string; color: string }> = {
+    ultra_luxury: { bg: "rgba(212,170,79,0.15)", color: "#b8923a" },
+    luxury: { bg: "rgba(12,27,58,0.08)", color: "#0c1b3a" },
+    popular: { bg: "rgba(107,147,192,0.12)", color: "#4a7bab" },
+  }
+  const tc = b.tier ? tierColors[b.tier] ?? tierColors.popular : null
 
   const handleClick = (e: React.MouseEvent) => {
     if (onClick) { e.preventDefault(); onClick() }
@@ -105,33 +108,33 @@ function ShipCard({ ship: s, onClick }: { ship: Ship; onClick?: () => void }) {
       onMouseEnter={(e) => { e.currentTarget.style.boxShadow = "0 4px 16px rgba(0,0,0,0.14)" }}
       onMouseLeave={(e) => { e.currentTarget.style.boxShadow = "0 1px 3px rgba(0,0,0,0.08)" }}
     >
-      {/* Image */}
+      {/* Cover image */}
       <div style={{ height: 160, background: "#0c1b3a", position: "relative", overflow: "hidden" }}>
-        {s.image ? (
-          <img
-            src={s.image}
-            alt={s.name}
-            loading="lazy"
-            style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
-          />
+        {coverImage ? (
+          <img src={coverImage} alt={b.name} loading="lazy" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
         ) : (
-          <div style={{
-            width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center",
-            color: "rgba(255,255,255,0.2)", fontSize: 44,
-          }}>
-            <Anchor size={44} />
+          <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <Anchor size={44} color="rgba(255,255,255,0.2)" />
           </div>
         )}
-        {/* Type badge */}
-        {s.type && (
+        {/* Gradient overlay for logo legibility */}
+        <div style={{ position: "absolute", inset: 0, background: "linear-gradient(to top, rgba(12,27,58,0.7) 0%, rgba(12,27,58,0.1) 60%, transparent 100%)" }} />
+        {/* Logo overlay */}
+        {b.logo && (
+          <div style={{ position: "absolute", bottom: 10, left: 12 }}>
+            <img src={b.logo} alt="" style={{ height: 22, width: "auto", objectFit: "contain", filter: "brightness(0) invert(1)", opacity: 0.9 }} />
+          </div>
+        )}
+        {/* Tier badge */}
+        {tc && tierKey && (
           <div style={{
             position: "absolute", top: 8, left: 8,
-            background: "rgba(12,27,58,0.88)", backdropFilter: "blur(8px)",
-            color: "#d4aa4f", fontSize: 10, fontWeight: 600,
+            background: tc.bg, color: tc.color,
+            fontSize: 10, fontWeight: 600,
             padding: "2px 8px", borderRadius: 4,
             textTransform: "uppercase", letterSpacing: "0.06em",
           }}>
-            {s.type}
+            {t(tierKey)}
           </div>
         )}
       </div>
@@ -139,52 +142,34 @@ function ShipCard({ ship: s, onClick }: { ship: Ship; onClick?: () => void }) {
       {/* Body */}
       <div style={{ padding: "12px 14px", flex: 1, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
         <div>
-          <div style={{ fontSize: 15, fontWeight: 600, lineHeight: 1.3, marginBottom: 2 }}>
-            {s.name}
+          <div style={{ fontSize: 15, fontWeight: 600, lineHeight: 1.3, marginBottom: 4 }}>
+            {b.name}
           </div>
-          {s.brand && (
-            <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 6 }}>
-              {s.brand}
+
+          {b.description && (
+            <div style={{ fontSize: 12, color: "#6b7280", lineHeight: 1.5, marginBottom: 8 }}>
+              {b.description.length > 100 ? b.description.slice(0, 100) + "..." : b.description}
             </div>
           )}
 
-          {/* Star rating */}
-          {s.starRating && s.starRating > 0 && (
-            <div style={{ display: "flex", gap: 1, marginBottom: 6 }}>
-              {Array.from({ length: Math.round(s.starRating) }).map((_, i) => (
-                <Star key={i} size={13} fill="#d4aa4f" color="#d4aa4f" />
-              ))}
+          {/* Stats */}
+          <div style={{ display: "flex", gap: 12, marginBottom: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#6b7280" }}>
+              <Ship size={12} color="#d4aa4f" />
+              <span>{b.shipCount} {t("ships_label")}</span>
             </div>
-          )}
-
-          {/* Specs */}
-          {specs.length > 0 && (
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 6 }}>
-              {specs.map((sp, i) => (
-                <span key={i} style={{
-                  fontSize: 11, padding: "2px 8px", borderRadius: 4,
-                  background: "#f5f5f0", color: "#6b7280", whiteSpace: "nowrap",
-                }}>
-                  {sp}
-                </span>
-              ))}
+            <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#6b7280" }}>
+              <Anchor size={12} color="#d4aa4f" />
+              <span>{b.cruiseCount} {t("cruises_label")}</span>
             </div>
-          )}
-
-          {/* Voyage count */}
-          {s.cruiseCount > 0 && (
-            <div style={{ fontSize: 11, color: "#9ca3af", display: "flex", alignItems: "center", gap: 4 }}>
-              <ShipIcon size={12} />
-              {t("upcoming_voyages", { n: s.cruiseCount })}
-            </div>
-          )}
+          </div>
         </div>
 
         <div style={{
           fontSize: 12, color: "#0c1b3a", fontWeight: 500, marginTop: 8,
           display: "flex", alignItems: "center", gap: 4,
         }}>
-          {t("view_ship")}
+          {t("view_brand")}
         </div>
       </div>
     </div>
